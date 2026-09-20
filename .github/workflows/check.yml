@@ -1,0 +1,108 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Emacs ${{ matrix.emacs-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.emacs-version == 'snapshot' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        emacs-version: ['27.1', '27.2', '28.2', '29.4', '30.2', 'snapshot']
+        include:
+          # Two macOS jobs, on the oldest version available there and on the
+          # newest release.  This package's whole job is to start a subprocess
+          # and keep its two output streams apart, and process handling is
+          # exactly where platforms differ.
+          #
+          # 28.1 rather than 27.1, which is this package's actual floor.
+          # macos-latest is Apple Silicon now, and nix-emacs-ci does not build
+          # anything below 28.1 for aarch64-darwin: its flake puts every older
+          # version behind `lib.optionalAttrs (system != "aarch64-darwin")',
+          # commented "Some versions do not currently build on MacOS".  Asking
+          # for 27.1 there fails with "does not provide attribute
+          # packages.aarch64-darwin.emacs-27-1" before Emacs is ever run.  The
+          # 27.1 floor is still tested, on Linux, where it is available.
+          - os: macos-latest
+            emacs-version: '28.1'
+          - os: macos-latest
+            emacs-version: '30.2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # purcell/setup-emacs builds from nix-emacs-ci, which is why the version
+      # list above can reach back to 27.1.  It supports Linux and macOS only.
+      - uses: purcell/setup-emacs@bdc64dc730ae1fcba200bfd52cb1b4cf6159cbe5
+        with:
+          version: ${{ matrix.emacs-version }}
+
+      # No agent is installed and none is needed: every test that runs a
+      # process runs a small shell script standing in for one.  A suite that
+      # called a real agent would need a paid API key in CI, would cost money
+      # per run, and would fail on a network hiccup rather than on a bug.
+      #
+      # This job is therefore the thing that keeps that true.  One test named a
+      # real provider and so passed only where that agent happened to be
+      # installed, which no amount of running it on a developer's machine would
+      # have revealed, because a developer's machine has the agent.
+      #
+      # diff is what the review step shells out to, and both runner images
+      # have it, so this only proves it is on PATH -- a missing one would
+      # otherwise surface as a confusing test failure rather than as a
+      # missing program.
+      - name: Show tool versions
+        run: |
+          emacs --version | head -1
+          diff --version | head -1
+          sh -c 'echo shell ok'
+
+      - name: Compile
+        run: make compile
+
+      - name: Test
+        run: make test
+
+      # The tests that start a process are run again, several times, on the
+      # oldest Emacs.  The sentinel bug they guard against (debbugs #63078,
+      # #68792) appears in some runs and not others, so one green run is not
+      # evidence: measured on 27.1 it was 7 failures in 10 runs before the
+      # fix, which means a single run had a real chance of passing anyway.
+      - name: Test process handling repeatedly on the oldest Emacs
+        if: matrix.emacs-version == '27.1'
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            echo "--- pass $i ---"
+            emacs -Q --batch -L . -l test/envoy-test.el \
+              --eval '(ert-run-tests-batch-and-exit "envoy-test-run-\\|envoy-test-prompt-arrives")'
+          done
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # package-lint checks the declared Emacs dependency against its own table
+      # of when each symbol appeared, so it wants a recent Emacs to have a
+      # complete table.  It is a separate job for that reason: running it once
+      # on the newest release says more than running it on every version.
+      - uses: purcell/setup-emacs@bdc64dc730ae1fcba200bfd52cb1b4cf6159cbe5
+        with:
+          version: '30.2'
+
+      - name: Lint
+        run: make lint
