@@ -287,6 +287,21 @@ leaves standard output empty."
        :cost (cdr (assq 'total_cost_usd envelope))
        :turns (cdr (assq 'num_turns envelope)))))))
 
+(defun envoy--check-brief (brief)
+  "Refuse a dispatch whose brief BRIEF carries no task, by signaling a user error.
+A brief that renders to nothing, or to only the placeholder word that
+stands where the task text belongs, still starts an agent and bills a
+run, and the run reports status lines for work that does not exist.
+Both transports call this before a process starts or a prompt file is
+written: `envoy-run' and `envoy-tmux-send'."
+  (let ((text (string-trim (or brief ""))))
+    (cond
+     ((string-empty-p text)
+      (user-error "Envoy: the rendered brief is empty; no agent was started"))
+     ((and (= (length text) 5)
+           (equal (downcase text) "brief"))
+      (user-error "Envoy: the rendered brief is only the placeholder word \"brief\"; no agent was started")))))
+
 (defun envoy-run (prompt callback &rest keys)
   "Send PROMPT to a coding agent and call CALLBACK with the result.
 CALLBACK receives one `envoy-result'.  Return the process, which
@@ -299,6 +314,7 @@ KEYS are keyword arguments:
 :directory  the directory to run in, which is what the agent treats as
             the project, and so decides which files it can find
 :timeout    seconds to wait, defaulting to `envoy-timeout'"
+  (envoy--check-brief prompt)
   (let* ((provider (plist-get keys :provider))
          (directory (or (plist-get keys :directory) default-directory))
          (timeout (or (plist-get keys :timeout) envoy-timeout))

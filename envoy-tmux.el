@@ -65,6 +65,8 @@
 (require 'envoy-process)
 (require 'envoy-org)
 (require 'org)
+
+(defvar org-agenda-mode-map)
 (require 'seq)
 (require 'subr-x)
 
@@ -86,6 +88,8 @@ One of the keys of `envoy-tmux-providers'."
      :args ()
      :prompt-arg nil
      :model-arg "--model"
+     :effort-arg nil
+     :efforts ()
      :variable setup
      :setup nil
      :setups ())
@@ -95,6 +99,8 @@ One of the keys of `envoy-tmux-providers'."
      :args ()
      :prompt-arg nil
      :model-arg "--model"
+     :effort-arg nil
+     :efforts ()
      :variable model
      :setup nil
      :models ())
@@ -104,6 +110,8 @@ One of the keys of `envoy-tmux-providers'."
      :args ()
      :prompt-arg "@%s"
      :model-arg "--model"
+     :effort-arg nil
+     :efforts ()
      :variable setup
      :setup nil
      :setups ())
@@ -120,6 +128,8 @@ One of the keys of `envoy-tmux-providers'."
      ;; so that :opening-input has somewhere to go.
      :prompt-arg nil
      :model-arg "--model"
+     :effort-arg nil
+     :efforts ()
      :variable setup
      :setup nil
      :setups ()
@@ -131,10 +141,25 @@ One of the keys of `envoy-tmux-providers'."
      :name "OMP"
      :args ()
      :prompt-arg "@%s"
+     :system-arg "--append-system-prompt=%s"
      :model-arg "--model"
+     :effort-arg "--thinking"
+     :efforts ("off" "minimal" "low" "medium" "high" "xhigh" "max" "auto")
      :variable model
      :setup nil
-     :models ()))
+    :models ())
+    (dsh
+     :program "dsh-launch"
+     :name "dsh"
+     :args ()
+     :prompt-arg "@%s"
+     :system-arg "--append-system-prompt=%s"
+     :model-arg "--model"
+     :effort-arg "--thinking"
+     :efforts ("off" "low" "high" "max")
+     :variable model
+     :setup nil
+     :models ("deepseek-flash" "deepseek-v4-pro")))
   "Agents envoy knows how to start in a tmux window.
 Each entry is (SYMBOL . PLIST).  The properties are:
 
@@ -147,7 +172,12 @@ Each entry is (SYMBOL . PLIST).  The properties are:
              \"\\\"$(cat %s)\\\"\" for one that takes the prompt itself
              as an argument.  nil for an agent that takes neither, and
              the brief is typed into it after it starts
+:system-arg  format string taking the shell-quoted path to a file
 :model-arg   option that selects a model
+:effort-arg  option that selects a thinking effort, or nil when the agent
+             has none
+:efforts     efforts to offer when :effort-arg is set; an empty answer
+             keeps the agent's default
 :variable    what a prefix argument asks for, `model' or `setup'
 :setup       shell command to run before the agent, or nil.  This is
              where a provider-selecting wrapper goes
@@ -342,22 +372,23 @@ provider exits."
     (with-temp-file file (insert prompt))
     (set-file-modes file #o600)
     file))
+(defun envoy-tmux--brief-heading (file)
+  "Return the first non-empty line of FILE, truncated to 120 chars, or \"\"."
+  (condition-case nil
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (let ((line (string-trim (or (thing-at-point 'line t) ""))))
+          (while (and (string-empty-p line) (not (eobp)))
+            (forward-line 1)
+            (setq line (string-trim (or (thing-at-point 'line t) ""))))
+          (truncate-string-to-width line 120 nil nil t)))
+    (error "")))
 
 (defcustom envoy-tmux-omp-query-timeout 5
   "Seconds to wait for an OMP model query before refusing the dispatch."
   :type 'number
   :group 'envoy)
-(defcustom envoy-tmux-omp-drive-program "omp-drive"
-  "The OMP Drive wrapper executable, looked up on the variable `exec-path'."
-  :type 'string
-  :group 'envoy)
-
-(defun envoy-tmux--omp-drive-program ()
-  "Return OMP's Drive wrapper path, or signal an actionable user error."
-  (or (executable-find envoy-tmux-omp-drive-program)
-      (user-error "Envoy: OMP Drive needs `%s', which is not on `exec-path'"
-                  envoy-tmux-omp-drive-program)))
-
 
 (defun envoy-tmux--omp-program ()
   "Return OMP's executable path, or signal an actionable user error."
@@ -537,76 +568,159 @@ Signal when a supplied selector is not a non-empty string."
                (format "; model catalog query: %s" catalog-error)
              "; OMP returned no model selectors")))))))
 
+(defcustom envoy-tmux-omp-model-cache-file
+  (expand-file-name "envoy-omp-models" user-emacs-directory)
+  "File that keeps the last successful OMP model discovery.
+A fresh entry answers the picker without running OMP again.  An entry
+of any age is offered when a new discovery fails, so an OMP whose
+state database is contended cannot refuse a dispatch.  Delete the file
+so the next prefixed dispatch discovers again."
+  :type 'file
+  :group 'envoy)
+
+(defcustom envoy-tmux-omp-model-cache-ttl 3600
+  "Seconds an OMP model discovery stays fresh in the cache file.
+Zero rediscovers on every picker call.  When discovery fails, a cached
+list still answers."
+  :type 'number
+  :group 'envoy)
+
+(defun envoy-tmux--omp-model-cache-read ()
+  "Return the last successful discovery as a plist, or nil.
+A missing or unreadable file, or an entry without a program string, a
+timestamp and a list of selectors, reads as nil."
+  (ignore-errors
+    (with-temp-buffer
+      (insert-file-contents envoy-tmux-omp-model-cache-file)
+      (goto-char (point-min))
+      (let ((entry (read (current-buffer))))
+        (and (stringp (plist-get entry :program))
+             (numberp (plist-get entry :time))
+             (let ((models (plist-get entry :models)))
+               (and (listp models)
+                    models
+                    (seq-every-p #'stringp models)
+                    entry)))))))
+
+(defun envoy-tmux--omp-model-cache-write (program models)
+  "Record PROGRAM's discovered MODELS as the last successful discovery.
+A cache write never refuses a dispatch, so an unwritable file is
+ignored.  Concurrent Emacs instances may interleave their writes, and
+a torn read reads as nil, so discovery runs again."
+  (ignore-errors
+    (with-temp-file envoy-tmux-omp-model-cache-file
+      (prin1 (list :program program :time (float-time) :models models)
+             (current-buffer))
+      (insert "\n"))
+    (set-file-modes envoy-tmux-omp-model-cache-file #o600)))
+
+(defun envoy-tmux--omp-models-cached (program)
+  "Return OMP's model selectors for PROGRAM, through the cache.
+An entry younger than `envoy-tmux-omp-model-cache-ttl' seconds answers
+without running OMP.  Otherwise discovery runs and its result replaces
+the cache.  A failure offers the cached selectors from an entry for the
+same program instead of refusing the dispatch."
+  (let ((cache (envoy-tmux--omp-model-cache-read)))
+    (if (and cache
+             (equal (plist-get cache :program) program)
+             (< (- (float-time) (plist-get cache :time))
+                envoy-tmux-omp-model-cache-ttl))
+        (plist-get cache :models)
+      (condition-case err
+          (let ((models (envoy-tmux--omp-discover-models program)))
+            (envoy-tmux--omp-model-cache-write program models)
+            models)
+        (error
+         (if (and cache (equal (plist-get cache :program) program))
+             (progn
+               (message "Envoy: OMP model discovery failed (%s). Using the cached model list"
+                        (error-message-string err))
+               (plist-get cache :models))
+           (signal (car err) (cdr err))))))))
+
 (defun envoy-tmux--omp-models ()
   "Return OMP model selectors for completion.
-An explicit non-empty provider :models list wins.  Otherwise consult
-`enabledModels' and fall back to the native model catalog."
+An explicit non-empty provider :models list wins.  Otherwise the
+discovery cache answers, as `envoy-tmux--omp-models-cached' describes."
   (let* ((plist (envoy-tmux--provider 'omp))
          (program (envoy-tmux--omp-program))
          (configured (envoy-tmux--omp-normalize-models
                       (plist-get plist :models))))
     (if configured
         (envoy-tmux--omp-expand-models program configured)
-      (envoy-tmux--omp-discover-models program))))
+      (envoy-tmux--omp-models-cached program))))
+
+
+
 
 (defun envoy-tmux-command (prompt-file &optional provider model setup plan-into
-                                             mode)
+                                        system-file effort)
   "Return the shell command that will start PROVIDER on PROMPT-FILE.
 MODEL is passed through the provider's :model-arg when given.  SETUP is a
 shell command to run first, defaulting to the provider's own :setup, and
-is what a wrapper that selects a provider or a profile goes in.  For OMP,
-the modes are Single model when MODEL is set, Plan into when PLAN-INTO is
-set, and Drive when MODE is `drive'.
+is what a wrapper that selects a provider or a profile goes in.  For OMP and
+dsh, MODEL selects the native single-model mode, and PLAN-INTO selects
+planner and executor mode.  EFFORT is passed through the provider's
+:effort-arg when given; nil keeps the agent's default.
+SYSTEM-FILE is passed through the provider's :system-arg when given.
 
 The result is one shell command line, because it is typed into a shell in
 a tmux window rather than executed here.  Everything variable in it is
 quoted for that shell; :prompt-arg is not, since it is the provider's own
 template and may need shell syntax of its own to deliver the prompt."
   (let* ((plist (envoy-tmux--provider provider))
-         (omp (eq (or provider envoy-tmux-provider) 'omp))
-         (drive (and omp (eq mode 'drive)))
-         (program (if drive
-                      (envoy-tmux--omp-drive-program)
-                    (envoy-tmux--provider-program provider)))
-         (setup (if (null setup) (plist-get plist :setup) setup))
+         (omp (memq (or provider envoy-tmux-provider) '(omp dsh)))
+         (program (envoy-tmux--provider-program provider))
          (prompt-arg (plist-get plist :prompt-arg))
+         (brief-heading (and omp prompt-arg
+                             (envoy-tmux--brief-heading prompt-file)))
+         (effort-arg (plist-get plist :effort-arg))
          (explicit-model (if omp
                              (and (stringp model) (not (string-empty-p model)))
                            model))
          (explicit-plan (and (stringp plan-into)
                              (not (string-empty-p plan-into))))
-         (omp-plan (and omp explicit-plan (not drive)))
+         (explicit-effort (and (stringp effort) (not (string-empty-p effort))))
+         (omp-plan (and omp explicit-plan))
          (args (plist-get plist :args)))
-    (when (and mode (not drive))
-      (user-error "Envoy: Drive mode is only supported by the OMP provider"))
     (when (and omp
                (or (and model (not explicit-model))
                    (and plan-into (not explicit-plan))))
-      (user-error "Envoy: OMP model selections must not be empty"))
+      (user-error "Envoy: %s model selections must not be empty"
+                  (envoy-tmux-provider-name provider)))
     (when (and plan-into (not omp))
-      (user-error "Envoy: plan-into is only supported by the OMP provider"))
-    (when (and drive plan-into)
-      (user-error "Envoy: Drive mode cannot select an execution model"))
+      (user-error "Envoy: plan-into is only supported by the OMP and dsh providers"))
     (when (and omp-plan (not explicit-model))
-      (user-error "Envoy: OMP plan mode needs a planner model"))
-    (when (and omp (or explicit-model drive))
+      (user-error "Envoy: %s plan mode needs a planner model"
+                  (envoy-tmux-provider-name provider)))
+    (when (and effort (not explicit-effort))
+      (user-error "Envoy: effort selection must not be empty"))
+    (when (and explicit-effort (not effort-arg))
+      (user-error "Envoy: %s does not support an effort selection"
+                  (envoy-tmux-provider-name provider)))
+    (when (or (and omp explicit-model) explicit-effort)
       (setq args
             (let ((filtered nil)
                   (skip-next nil))
               (dolist (arg args (nreverse filtered))
                 (cond
                  (skip-next (setq skip-next nil))
-                 ((or (string-match-p "\\`--model=" arg)
-                      (string-match-p "\\`--plan-yolo-into=" arg)
-                      (string-match-p "\\`--plan-yolo=" arg)) nil)
-                 ((member arg '("--plan-yolo")) nil)
-                 ((member arg '("--model" "--plan-yolo-into"))
+                 ((and explicit-model
+                       (or (string-match-p "\\`--model=" arg)
+                           (string-match-p "\\`--plan-yolo-into=" arg)
+                           (string-match-p "\\`--plan-yolo=" arg)
+                           (equal arg "--plan-yolo"))) nil)
+                 ((and explicit-model
+                       (member arg '("--model" "--plan-yolo-into")))
+                  (setq skip-next t))
+                 ((and explicit-effort
+                       (string-match-p
+                        (concat "\\`" (regexp-quote effort-arg) "=") arg)) nil)
+                 ((and explicit-effort (equal arg effort-arg))
                   (setq skip-next t))
                  (t (push arg filtered)))))))
     (concat (when (and setup (not (string-empty-p setup)))
               (concat setup " && "))
-            (when (and drive explicit-model)
-              (concat "OMP_DRIVE_MODEL=" (shell-quote-argument model) " "))
             (shell-quote-argument program)
             (mapconcat (lambda (arg) (concat " " (shell-quote-argument arg)))
                        (append args
@@ -615,16 +729,19 @@ template and may need shell syntax of its own to deliver the prompt."
                                  (list "--model" model
                                        "--plan-yolo"
                                        "--plan-yolo-into" plan-into))
-                                ((and explicit-model (plist-get plist :model-arg)
-                                      (not drive))
-                                 (list (plist-get plist :model-arg) model))))
+                                ((and explicit-model (plist-get plist :model-arg))
+                                 (list (plist-get plist :model-arg) model)))
+                               (when explicit-effort
+                                 (list effort-arg effort)))
                        "")
+            (when (and brief-heading (not (string-empty-p brief-heading)))
+              (concat " " (shell-quote-argument brief-heading)))
             (when prompt-arg
               (concat " " (format prompt-arg
-                                  (shell-quote-argument prompt-file)))))))
-
-
-
+                                  (shell-quote-argument prompt-file))))
+            (when (and system-file (plist-get plist :system-arg))
+              (concat " " (format (plist-get plist :system-arg)
+                                  (shell-quote-argument system-file)))))))
 (defconst envoy-tmux--type-chunk 4096
   "How much of a typed prompt to hand tmux at a time.
 Under the terminal's own input queue, which is the limit that decides
@@ -775,17 +892,44 @@ is non-nil, return only after every piece and the final Enter succeed."
           (cancel-timer timer))))))
 
 
-(defun envoy-tmux--prompt-file-cleanup (target file)
-  "Return the command to remove FILE after the provider exits in TARGET."
+(defun envoy-tmux--cmd-shell-p (target)
+  "Return non-nil when TARGET is running a Windows command shell."
   (let* ((answer (envoy-tmux--call "display-message" "-p" "-t" target
                                   "#{pane_current_command}"))
-         (shell (and answer
-                     (zerop (car answer))
-                     (cdr answer))))
-    (if (and shell
-             (member (file-name-nondirectory shell) '("cmd" "cmd.exe")))
-        (concat " & del /q \"" file "\"")
-      (concat "; rm -f -- " (shell-quote-argument file)))))
+         (shell (and answer (zerop (car answer)) (cdr answer))))
+    (and shell
+         (member (file-name-nondirectory shell) '("cmd" "cmd.exe")))))
+
+(defun envoy-tmux--prompt-file-cleanup (target file)
+  "Return the command to remove FILE after the provider exits in TARGET."
+  (if (envoy-tmux--cmd-shell-p target)
+      (concat " & del /q \"" file "\"")
+    (concat "; rm -f -- " (shell-quote-argument file))))
+
+(defun envoy-tmux--exit-fallback (target claim)
+  "Return a POSIX shell guard that publishes an incomplete report for CLAIM.
+Nothing is returned when the shell in tmux TARGET is a Windows command shell."
+  (let ((key (plist-get claim :key))
+        (token (plist-get claim :token)))
+    (when (and key token (not (envoy-tmux--cmd-shell-p target)))
+      (let ((claim-file
+             (envoy-org--spool-file key envoy-org--spool-claim-suffix))
+            (done-file
+             (envoy-org--spool-file key envoy-org--spool-done-suffix))
+            (failed-file
+             (envoy-org--spool-file key envoy-org--spool-failed-suffix))
+            (temporary-prefix
+             (envoy-org--spool-file key (format ".exit-%s" token))))
+        (concat "; if [ -f " (shell-quote-argument claim-file)
+                " ] && grep -qF " (shell-quote-argument token) " "
+                (shell-quote-argument claim-file)
+                " && [ ! -e " (shell-quote-argument done-file)
+                " ] && [ ! -e " (shell-quote-argument failed-file)
+                " ]; then tmp=" (shell-quote-argument temporary-prefix)
+                ".$$.tmp; printf '%s\\n' 'ENVOY_STATUS: incomplete' "
+                "'The agent exited without publishing a report.' > \"$tmp\"; "
+                "mv -n -- \"$tmp\" " (shell-quote-argument failed-file)
+                "; fi")))))
 
 (defcustom envoy-tmux-draw-timeout 20
   "Seconds to wait for an agent's interface to appear before typing at it.
@@ -864,30 +1008,44 @@ it at all."
         (sleep-for envoy-tmux-type-pause)))))
 
 (defun envoy-tmux-send (target prompt &optional provider model setup plan-into
-                                      mode on-start)
+                                      on-start claim effort)
   "Start PROVIDER in tmux TARGET and give it PROMPT.
-MODEL, SETUP, PLAN-INTO and MODE are as in `envoy-tmux-command'.  Return the
+MODEL, SETUP, PLAN-INTO and EFFORT are as in `envoy-tmux-command'.  Return the
 file the brief was written to when PROVIDER reads one, or nil when it is
-typed.  OMP's modes are Single model, Plan into and Drive.  ON-START is
-called immediately after the launch command is submitted, before Envoy waits
-for or types anything else.
+typed.  ON-START is called immediately after the launch command is submitted,
+before Envoy waits for or types anything else.
+CLAIM is the heading's spool claim.  Providers with :system-arg receive the
+report instructions in a private file when CLAIM is given.
 
 The command line is sent literally and submitted with an Enter of its own,
 so the quotes and dollar signs a provider's :prompt-arg may hold reach the
 shell instead of being read as key names.  Once that Enter succeeds, the
-provider may still need its prompt file even when a later send step fails."
+provider may still need its prompt file even when a later send step fails.
+A brief that is empty or only the placeholder word is refused first, by
+`envoy--check-brief', before a prompt file is written or a key is sent."
+  (envoy--check-brief prompt)
   (let* ((plist (envoy-tmux--provider provider))
          (prompt-arg (plist-get plist :prompt-arg))
+         (system-arg (plist-get plist :system-arg))
          (file (when prompt-arg (envoy-tmux--write-prompt prompt)))
+         (system-file nil)
          (launched nil))
     (unwind-protect
         (progn
+          (when (and claim system-arg (plist-get claim :key))
+            (setq system-file
+                  (envoy-tmux--write-prompt
+                   (envoy-org-report-contract (plist-get claim :key)))))
           (let ((command (envoy-tmux-command file provider model setup
-                                             plan-into mode)))
-            (when prompt-arg
+                                             plan-into system-file effort)))
+            (when claim
+              (setq command
+                    (concat command (envoy-tmux--exit-fallback target claim))))
+            (dolist (cleanup-file (delq nil (list file system-file)))
               (setq command
                     (concat command
-                            (envoy-tmux--prompt-file-cleanup target file))))
+                            (envoy-tmux--prompt-file-cleanup
+                             target cleanup-file))))
             (let ((answer (envoy-tmux--call "send-keys" "-t" target "-l"
                                             command)))
               (unless (and answer (zerop (car answer)))
@@ -905,23 +1063,38 @@ provider may still need its prompt file even when a later send step fails."
             (envoy-tmux-type target prompt (plist-get plist :program) t))
           file)
       (unless launched
-        (when (and file (file-exists-p file))
-          (delete-file file))))))
+        (dolist (temporary (list file system-file))
+          (when (and temporary (file-exists-p temporary))
+            (delete-file temporary)))))))
 
 (defun envoy-tmux--read-variable (provider)
   "Ask for the prefix-controlled selection for PROVIDER.
-Return a plist with :model, :setup, :plan-into and :mode.  OMP offers
-Single model, Plan into and Drive; other providers retain their one
-model-or-setup choice."
+Return a plist with :model, :setup, :plan-into and :effort.  OMP and dsh offer
+Single model and Plan into; other providers retain their one model-or-setup
+choice."
   (let* ((plist (envoy-tmux--provider provider))
          (variable (plist-get plist :variable))
-         (choices (plist-get plist (if (eq variable 'model) :models :setups))))
-    (if (eq provider 'omp)
-        (let ((models (envoy-tmux--omp-models)))
+         (choices (plist-get plist (if (eq variable 'model) :models :setups)))
+         (efforts (plist-get plist :efforts))
+         (read-effort
+          (lambda ()
+            (when efforts
+              (let ((effort
+                     (completing-read
+                      (format "Thinking effort for %s: "
+                              (envoy-tmux-provider-name provider))
+                      efforts nil nil)))
+                (unless (string-empty-p effort)
+                  effort))))))
+    (if (memq provider '(omp dsh))
+        (let* ((name (envoy-tmux-provider-name provider))
+               (models (if (eq provider 'omp)
+                           (envoy-tmux--omp-models)
+                         (plist-get plist :models))))
           (unless models
-            (user-error "Envoy: OMP supplied no model selectors"))
-          (let ((mode (completing-read "OMP launch mode: "
-                                       '("Single model" "Plan into" "Drive")
+            (user-error "Envoy: %s supplied no model selectors" name))
+          (let ((mode (completing-read (format "%s launch mode: " name)
+                                       '("Single model" "Plan into")
                                        nil t))
                 (read-model
                  (lambda (prompt &optional available-models)
@@ -930,22 +1103,22 @@ model-or-setup choice."
                                   prompt (or available-models models)
                                   nil nil)))
                      (if (string-empty-p model)
-                         (user-error "Envoy: OMP model selection was empty")
+                         (user-error "Envoy: %s model selection was empty"
+                                     name)
                        model)))))
             (cond
              ((equal mode "Single model")
-              (list :model (funcall read-model "Model for OMP: ")
-                    :setup nil :plan-into nil))
+              (list :model (funcall read-model (format "Model for %s: " name))
+                    :setup nil :plan-into nil
+                    :effort (funcall read-effort)))
              ((equal mode "Plan into")
-              (let ((planner (funcall read-model "Planner model for OMP: "))
-                    (executor (funcall read-model "Execution model for OMP: ")))
-                (list :model planner :setup nil :plan-into executor)))
-             ((equal mode "Drive")
-              (let ((driver (funcall read-model "Driver model for OMP: "
-                                      (cons "Default driver" models))))
-                (list :model (unless (equal driver "Default driver") driver)
-                      :setup nil :plan-into nil :mode 'drive)))
-             (t (user-error "Envoy: unknown OMP launch mode %s" mode)))))
+              (let ((planner (funcall read-model
+                                      (format "Planner model for %s: " name)))
+                    (executor (funcall read-model
+                                       (format "Execution model for %s: " name))))
+                (list :model planner :setup nil :plan-into executor
+                      :effort (funcall read-effort))))
+             (t (user-error "Envoy: unknown %s launch mode %s" name mode)))))
       (if (eq variable 'model)
           (let ((model (completing-read
                         (format "Model for %s: "
@@ -954,13 +1127,15 @@ model-or-setup choice."
             (if (string-empty-p model)
                 (user-error "Envoy: %s model selection was empty"
                             (envoy-tmux-provider-name provider))
-              (list :model model :setup nil :plan-into nil)))
+              (list :model model :setup nil :plan-into nil
+                    :effort (funcall read-effort))))
         (list :model nil
               :setup (completing-read
                       (format "Command before %s: "
                               (envoy-tmux-provider-name provider))
                       choices nil nil)
-              :plan-into nil)))))
+              :plan-into nil
+              :effort (funcall read-effort))))))
 
 (defun envoy-tmux--attachment-state (directory)
   "Return the current heading and attachment state for DIRECTORY."
@@ -994,209 +1169,230 @@ model-or-setup choice."
          (equal token (envoy-org--spool-claim-token file)))))
 
 (defun envoy-tmux-org-heading-to (provider &optional model setup plan-into
-                                             session mode select)
-  "Hand the org heading at point to PROVIDER in a tmux window.
-MODEL, SETUP, PLAN-INTO and MODE are as in `envoy-tmux-command'.  SESSION is the
-name to use, or nil to ask for one.  When SELECT is non-nil, ask for the
-provider's model, setup and OMP mode after claiming the heading.
+                                             session select direction effort)
+  "Hand an Org heading or selected agenda entry to PROVIDER in tmux.
+MODEL, SETUP, PLAN-INTO and EFFORT are as in `envoy-tmux-command'.  SESSION
+is the name to use, or nil to ask for one.  When SELECT is non-nil, ask for the
+provider's model, setup or effort after the direction.
 
-The heading is claimed by its Org ID before provider discovery, selection,
-session selection or window creation.  An active claim or pending report
-marker stops a second dispatch.  Once the launch command is submitted, the
-claim, state and attachment preparation stay in place until report
-collection, even if a later send step or keyword update fails.
+After preflight, a direction is always asked first unless DIRECTION was
+provided.  A nil DIRECTION asks for it.  The heading is claimed by its Org ID
+before provider discovery, direction, selection, session selection or window
+creation.  An active claim or pending report marker stops a second dispatch.
+Once the launch command is submitted, the claim, state and attachment
+preparation stay in place until report collection, even if a later send step
+or keyword update fails.
 
 The brief is the same one `envoy-org-heading' sends: the whole subtree,
 every ancestor heading that is not datetree scaffolding, and the attachment
 directories of the heading and of those ancestors.  What differs is the
 delivery.  The agent runs in a terminal you can attach to and answer."
-  (unless (derived-mode-p 'org-mode)
-    (user-error "Envoy: not an org buffer"))
-  (unless (buffer-file-name)
-    (user-error "Envoy: this org buffer is not visiting a file"))
-  (when (buffer-modified-p)
-    (if (y-or-n-p "Save this buffer first? ")
-        (save-buffer)
-      (user-error "Envoy: the buffer has unsaved changes")))
-  (org-back-to-heading t)
-  (let* ((title (org-get-heading t t t t))
-         (subtree (envoy-org--subtree-text))
-         (attachment-root
-          (expand-file-name org-attach-id-dir
-                            (file-name-directory
-                             (or buffer-file-name default-directory))))
-         (previous-attachment-root (file-directory-p attachment-root))
-         (previous-attach-dir (ignore-errors (org-attach-dir nil t)))
-         attach-tag
-         attach-tag-present-before-setup
-         target
-         attach-dir
-         attach-tag-created
-         attachment-state
-         claim-key
-         claim
-         launched)
-    (let* ((identity (envoy-org--heading-identity))
-           (id (nth 0 identity)))
-      (setq claim (envoy-org--spool-claim id title)
-            claim-key (plist-get claim :key))
-      (unwind-protect
-          (progn
-            (when select
-              (let ((choice (envoy-tmux--read-variable provider)))
-                (setq model (plist-get choice :model)
-                      setup (plist-get choice :setup)
-                      plan-into (plist-get choice :plan-into)
-                      mode (plist-get choice :mode))))
-            (envoy-tmux--provider-program provider)
-            (when (eq provider 'omp)
-              (envoy-tmux--omp-program)
-              (when (eq mode 'drive)
-                (envoy-tmux--omp-drive-program)))
-            (setq session (or session (envoy-tmux-read-session provider)))
-            (setq target (envoy-tmux-window session title))
-            (when (buffer-modified-p)
-              (save-buffer))
-            (setq attach-tag
-                  (and org-attach-auto-tag
-                       (if (stringp org-attach-auto-tag)
-                           org-attach-auto-tag
-                         "ATTACH")))
-            (setq attach-tag-present-before-setup
-                  (and attach-tag
-                       (member attach-tag (org-get-tags nil t))))
-            (setq attach-dir (envoy-org--attach-directory))
-            (setq attach-tag-created
-                  (and attach-tag
-                       (not attach-tag-present-before-setup)
-                       (member attach-tag (org-get-tags nil t))))
-            (setq attachment-state
-                  (and attach-dir
-                       (envoy-tmux--attachment-state attach-dir)))
-            (let* ((task-files (envoy-org--attachment-files attach-dir))
-                   (spool-key (envoy-org--spool-open title task-files))
-                   (prompt (envoy-org-build-prompt title subtree attach-dir
-                                                   task-files spool-key)))
-              (envoy-tmux-send
-               target prompt provider model setup plan-into mode
-               (lambda () (setq launched t)))
-              (setq launched t)
-              (when (envoy-tmux--claim-owned-p claim)
-                (envoy-org--set-keyword envoy-org-active-keyword)))
-            (message "Envoy: %s has \"%s\" in tmux %s"
-                     (envoy-tmux-provider-name provider) title target)
-            target)
-        (unless launched
-          (when (envoy-tmux--claim-owned-p claim)
-            (when claim-key
-              (ignore-errors
-                (let ((state (envoy-org--spool-file
-                              claim-key envoy-org--spool-state-suffix)))
-                  (when (file-exists-p state)
-                    (delete-file state)))))
-            (let ((attachment-state-unchanged
-                   (and (consp attachment-state)
-                        (condition-case nil
-                            (let ((current-state
-                                   (envoy-tmux--attachment-state attach-dir)))
-                              (and (consp current-state)
-                                   (equal attachment-state current-state)))
-                          (file-error nil)))))
-              (when (and attachment-state-unchanged
-                         attach-dir
-                         (not previous-attach-dir)
-                         (file-directory-p attach-dir))
-                (let ((directory (file-name-as-directory attach-dir))
-                      (root (file-name-as-directory attachment-root)))
-                  (while (and (file-directory-p directory)
-                              (string-prefix-p root directory))
-                    (if (and (equal directory root)
-                             previous-attachment-root)
-                        (setq directory nil)
-                      (condition-case nil
-                          (when (null (directory-files directory nil
-                                                       "\\`[^.]\\|\\`\\.[^.]" t))
-                            (ignore-errors (delete-directory directory)))
-                        (file-error nil))
-                      (setq directory
-                            (file-name-as-directory
-                             (file-name-directory
-                              (directory-file-name directory))))))))
-              (when (and attachment-state-unchanged
-                         attach-tag-created
-                         (member attach-tag (org-get-tags nil t)))
+  (if (derived-mode-p 'org-agenda-mode)
+      (envoy-org--with-agenda-heading #'envoy-tmux-org-heading-to
+                                      provider model setup plan-into
+                                      session select direction effort)
+    (progn
+      (unless (derived-mode-p 'org-mode)
+        (user-error "Envoy: not an org buffer"))
+      (unless (buffer-file-name)
+        (user-error "Envoy: this org buffer is not visiting a file"))
+      (when (buffer-modified-p)
+        (if (y-or-n-p "Save this buffer first? ")
+            (save-buffer)
+          (user-error "Envoy: the buffer has unsaved changes")))
+      (org-back-to-heading t)
+    (let* ((title (org-get-heading t t t t))
+           (subtree (envoy-org--subtree-text))
+           (attachment-root
+            (expand-file-name org-attach-id-dir
+                              (file-name-directory
+                               (or buffer-file-name default-directory))))
+           (previous-attachment-root (file-directory-p attachment-root))
+           (previous-attach-dir (ignore-errors (org-attach-dir nil t)))
+           attach-tag
+           attach-tag-present-before-setup
+           target
+           attach-dir
+           attach-tag-created
+           attachment-state
+           claim-key
+           claim
+           launched)
+      (let* ((identity (envoy-org--heading-identity))
+             (id (nth 0 identity)))
+        (setq claim (envoy-org--spool-claim id title)
+              claim-key (plist-get claim :key))
+        (unwind-protect
+            (progn
+              (envoy-tmux--provider-program provider)
+              (when (eq provider 'omp)
+                (envoy-tmux--omp-program))
+              (setq direction
+                    (or direction
+                        (envoy--read-direction
+                         (format "Direction for %s: "
+                                 (envoy-tmux-provider-name provider)))))
+              (when select
+                (let ((choice (envoy-tmux--read-variable provider)))
+                  (setq model (plist-get choice :model)
+                        setup (plist-get choice :setup)
+                        plan-into (plist-get choice :plan-into)
+                        effort (plist-get choice :effort))))
+              (setq session (or session (envoy-tmux-read-session provider)))
+              (setq target (envoy-tmux-window session title))
+              (when (buffer-modified-p)
+                (save-buffer))
+              (setq attach-tag
+                    (and org-attach-auto-tag
+                         (if (stringp org-attach-auto-tag)
+                             org-attach-auto-tag
+                           "ATTACH")))
+              (setq attach-tag-present-before-setup
+                    (and attach-tag
+                         (member attach-tag (org-get-tags nil t))))
+              (setq attach-dir (envoy-org--attach-directory))
+              (setq attach-tag-created
+                    (and attach-tag
+                         (not attach-tag-present-before-setup)
+                         (member attach-tag (org-get-tags nil t))))
+              (setq attachment-state
+                    (and attach-dir
+                         (envoy-tmux--attachment-state attach-dir)))
+              (let* ((task-files (envoy-org--attachment-files attach-dir))
+                     (spool-key (envoy-org--spool-open title task-files))
+                     (prompt (envoy-org-build-prompt title subtree attach-dir
+                                                     task-files spool-key direction)))
+                (envoy-tmux-send
+                 target prompt provider model setup plan-into
+                 (lambda () (setq launched t)) claim effort)
+                (setq launched t)
+                (when (envoy-tmux--claim-owned-p claim)
+                  (envoy-org--set-keyword envoy-org-active-keyword)))
+              (message "Envoy: %s has \"%s\" in tmux %s"
+                       (envoy-tmux-provider-name provider) title target)
+              target)
+          (unless launched
+            (when (envoy-tmux--claim-owned-p claim)
+              (when claim-key
                 (ignore-errors
-                  (org-toggle-tag attach-tag 'off)
-                  (when (and (buffer-file-name) (buffer-modified-p))
-                    (save-buffer)))))
-            (envoy-org--spool-release-claim claim)))))))
+                  (let ((state (envoy-org--spool-file
+                                claim-key envoy-org--spool-state-suffix)))
+                    (when (file-exists-p state)
+                      (delete-file state)))))
+              (let ((attachment-state-unchanged
+                     (and (consp attachment-state)
+                          (condition-case nil
+                              (let ((current-state
+                                     (envoy-tmux--attachment-state attach-dir)))
+                                (and (consp current-state)
+                                     (equal attachment-state current-state)))
+                            (file-error nil)))))
+                (when (and attachment-state-unchanged
+                           attach-dir
+                           (not previous-attach-dir)
+                           (file-directory-p attach-dir))
+                  (let ((directory (file-name-as-directory attach-dir))
+                        (root (file-name-as-directory attachment-root)))
+                    (while (and (file-directory-p directory)
+                                (string-prefix-p root directory))
+                      (if (and (equal directory root)
+                               previous-attachment-root)
+                          (setq directory nil)
+                        (condition-case nil
+                            (when (null (directory-files directory nil
+                                                         "\\`[^.]\\|\\`\\.[^.]" t))
+                              (ignore-errors (delete-directory directory)))
+                          (file-error nil))
+                        (setq directory
+                              (file-name-as-directory
+                               (file-name-directory
+                                (directory-file-name directory))))))))
+                (when (and attachment-state-unchanged
+                           attach-tag-created
+                           (member attach-tag (org-get-tags nil t)))
+                  (ignore-errors
+                    (org-toggle-tag attach-tag 'off)
+                    (when (and (buffer-file-name) (buffer-modified-p))
+                      (save-buffer)))))
+            (envoy-org--spool-release-claim claim)))))))))
 ;;;###autoload
 (defun envoy-tmux-org-heading (&optional arg)
   "Hand the org heading at point to `envoy-tmux-provider' in a tmux window.
-With a prefix argument ARG, ask for that provider's selection after claiming
-the heading."
+Ask for a direction first.  With a prefix argument ARG, ask for that
+provider's selection; OMP also asks for a thinking effort."
   (interactive "P")
   (envoy-tmux-org-heading-to envoy-tmux-provider
-                             nil nil nil nil nil arg))
+                             nil nil nil nil arg))
 
 (defun envoy-tmux--dispatch (provider arg)
-  "Hand the heading at point to PROVIDER, selecting it after claiming when ARG."
-  (envoy-tmux-org-heading-to provider nil nil nil nil nil arg))
+  "Hand the heading to PROVIDER, asking for direction first.
+With ARG, ask for the provider's selection after the direction."
+  (envoy-tmux-org-heading-to provider nil nil nil nil arg))
 
 ;;;###autoload
 (defun envoy-tmux-org-heading-claude (&optional arg)
-  "Hand the org heading at point to Claude Code in a tmux window.
-With a prefix argument ARG, ask first for what its :variable names."
+  "Hand the org heading to Claude Code in tmux, asking for direction first.
+With a prefix argument ARG, ask for its selection after the direction."
   (interactive "P")
   (envoy-tmux--dispatch 'claude arg))
 
 ;;;###autoload
 (defun envoy-tmux-org-heading-reasonix (&optional arg)
-  "Hand the org heading at point to reasonix in a tmux window.
-With a prefix argument ARG, ask first for what its :variable names."
+  "Hand the org heading to reasonix in tmux, asking for direction first.
+With a prefix argument ARG, ask for its selection after the direction."
   (interactive "P")
   (envoy-tmux--dispatch 'reasonix arg))
 
 ;;;###autoload
 (defun envoy-tmux-org-heading-pi (&optional arg)
-  "Hand the org heading at point to pi in a tmux window.
-With a prefix argument ARG, ask first for what its :variable names."
+  "Hand the org heading to pi in tmux, asking for direction first.
+With a prefix argument ARG, ask for its selection after the direction."
   (interactive "P")
   (envoy-tmux--dispatch 'pi arg))
 
 ;;;###autoload
 (defun envoy-tmux-org-heading-codex (&optional arg)
-  "Hand the org heading at point to Codex in a tmux window.
-With a prefix argument ARG, ask first for what its :variable names."
+  "Hand the org heading to Codex in tmux, asking for direction first.
+With a prefix argument ARG, ask for its selection after the direction."
   (interactive "P")
   (envoy-tmux--dispatch 'codex arg))
  
 ;;;###autoload
 (defun envoy-tmux-org-heading-omp (&optional arg)
-  "Hand the org heading at point to OMP in a tmux window.
-With a prefix argument ARG, ask first for Single model, Plan into or Drive."
+  "Hand the org heading to OMP in tmux, asking for direction first.
+With a prefix argument ARG, ask for Single model or Plan into and an effort
+level afterwards."
   (interactive "P")
   (envoy-tmux--dispatch 'omp arg))
 
+;;;###autoload
+(defun envoy-tmux-org-heading-dsh (&optional arg)
+  "Hand the org heading to dsh in tmux, asking for direction first.
+With a prefix argument ARG, ask for Single model or Plan into and an effort
+level afterwards."
+  (interactive "P")
+  (envoy-tmux--dispatch 'dsh arg))
 
 ;;;###autoload
 (defun envoy-tmux-setup-keys ()
-  "Bind the tmux commands in `org-mode-map'.
-Not done for you, for the reason `envoy-org-setup-keys' is not.
-
-These five uppercase shortcuts use org commands.  `key-binding' returns nil
-before binding, but lowercase fallback still runs.  The `O' shortcut would run
-`org-toggle-ordered-property'.  The `C' shortcut would run
-`org-clone-subtree-with-time-shift', and the `A' shortcut would run
-`org-archive-to-archive-sibling'.  These results came from pressing each
-sequence.  A binding takes the shortcut.  The lowercase key keeps working."
+  "Bind tmux commands in Org and agenda maps.
+The Claude shortcut replaces Org's archive shortcut.  When both setup functions
+run, the one called last owns the shared shortcut."
   (interactive)
   (require 'org)
+  (require 'org-agenda)
   (define-key org-mode-map (kbd "C-c C-x A") #'envoy-tmux-org-heading-claude)
   (define-key org-mode-map (kbd "C-c C-x R") #'envoy-tmux-org-heading-reasonix)
   (define-key org-mode-map (kbd "C-c C-x P") #'envoy-tmux-org-heading-pi)
   (define-key org-mode-map (kbd "C-c C-x O") #'envoy-tmux-org-heading-omp)
-  (define-key org-mode-map (kbd "C-c C-x C") #'envoy-tmux-org-heading-codex))
+  (define-key org-mode-map (kbd "C-c C-x S") #'envoy-tmux-org-heading-dsh)
+  (define-key org-mode-map (kbd "C-c C-x C") #'envoy-tmux-org-heading-codex)
+  (define-key org-agenda-mode-map (kbd "C-c C-x A") #'envoy-tmux-org-heading-claude)
+  (define-key org-agenda-mode-map (kbd "C-c C-x R") #'envoy-tmux-org-heading-reasonix)
+  (define-key org-agenda-mode-map (kbd "C-c C-x P") #'envoy-tmux-org-heading-pi)
+  (define-key org-agenda-mode-map (kbd "C-c C-x O") #'envoy-tmux-org-heading-omp)
+  (define-key org-agenda-mode-map (kbd "C-c C-x S") #'envoy-tmux-org-heading-dsh)
+  (define-key org-agenda-mode-map (kbd "C-c C-x C") #'envoy-tmux-org-heading-codex))
 
 (provide 'envoy-tmux)
 

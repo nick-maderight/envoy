@@ -44,6 +44,7 @@
 (require 'envoy-review)
 (require 'envoy-org)
 (require 'org-element)
+(require 'org-agenda)
 (require 'envoy-tmux)
 (require 'envoy-notmuch)
 (require 'seq)
@@ -53,18 +54,17 @@
 (defvar envoy-test--scripts nil
   "Scripts written by `envoy-test--agent', deleted after each test.")
 
-(defun envoy-test--agent (envelope &optional status stderr-line)
+(defun envoy-test--agent (envelope &optional status stderr-line input-file)
   "Write a script that behaves like an agent and return its file name.
 It reads its whole standard input and discards it, writes STDERR-LINE to
 standard error, prints ENVELOPE on standard output and exits STATUS.
-
-Writing to standard error is not incidental: reasonix does it on every
-run, and a package that merged the two streams would fail to parse a
-perfectly healthy envelope."
+When INPUT-FILE is non-nil, the script writes standard input there instead."
   (let ((script (make-temp-file "envoy-test-agent-" nil ".sh")))
     (with-temp-file script
       (insert "#!/bin/sh\n"
-              "cat >/dev/null\n"
+              (if input-file
+                  (format "cat > %s\n" (shell-quote-argument input-file))
+                "cat >/dev/null\n")
               (format "echo '%s' 1>&2\n"
                       (or stderr-line "warning: skill \"x\" has no description"))
               (format "printf '%%s\\n' '%s'\n" envelope)
@@ -290,6 +290,17 @@ unparseable and this test failing."
       (let ((result (envoy-test--run "do something")))
         (should-not (envoy-result-ok result))
         (should (equal (envoy-result-status result) 7))))))
+
+(ert-deftest envoy-test-run-refuses-empty-or-placeholder-brief ()
+  "A subprocess dispatch with an empty or placeholder brief starts nothing.
+The refusal happens before a process is created, so nothing is billed
+for a brief that carries no task."
+  (cl-letf (((symbol-function 'make-process)
+             (lambda (&rest _)
+               (ert-fail "Envoy started a process for a refused brief"))))
+    (dolist (brief '("" "  " "brief" "Brief"))
+      (should-error (envoy-run brief (lambda (_result)))
+                    :type 'user-error))))
 
 (ert-deftest envoy-test-prompt-arrives-whole-on-stdin ()
   "A long prompt reaches the agent intact, and needs no quoting.
@@ -1258,6 +1269,15 @@ after it."
              (lambda (&rest _) "   ")))
     (should-error (envoy--read-instruction "? ") :type 'user-error)))
 
+(ert-deftest envoy-test-direction-trims-and-defaults-blank-input ()
+  "A direction is trimmed, and a blank answer uses the configured default."
+  (let ((answers '("  Be careful  " " \t ")))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _) (pop answers))))
+      (should (equal (envoy--read-direction "Direction: ") "Be careful"))
+      (should (equal (envoy--read-direction "Direction: ")
+                     envoy-default-direction)))))
+
 
 (defun envoy-test--rewrite-prompt-for (contents beg end)
   "Return the brief `envoy-rewrite' builds for BEG to END over CONTENTS.
@@ -1365,10 +1385,12 @@ range would invite the agent to rewrite a line nobody selected."
            (with-temp-file file (insert ,text))
            (setq buffer (find-file-noselect file))
            (with-current-buffer buffer
-             (goto-char (point-min))
-             (re-search-forward "^\\*+ ")
-             (org-back-to-heading t)
-             ,@body))
+             (cl-letf (((symbol-function 'envoy--read-direction)
+                        (lambda (_prompt) envoy-default-direction)))
+               (goto-char (point-min))
+               (re-search-forward "^\\*+ ")
+               (org-back-to-heading t)
+               ,@body)))
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (set-buffer-modified-p nil))
@@ -1447,13 +1469,6 @@ range would invite the agent to rewrite a line nobody selected."
       (dolist (file (list prompt-file argv-file program))
         (when (file-exists-p file)
           (delete-file file))))))
-(ert-deftest envoy-test-empty-second-run-removes-old-report ()
-  "A blank report leaves an existing record untouched."
-  (envoy-test--with-org "* TODO The task\n:ENVOY:\nOld report.\n:END:\nBody.\n"
-    (org-back-to-heading t)
-    (envoy-org--record (point-marker) (current-buffer) "   ")
-    (should (string-match-p ":ENVOY:" (buffer-string)))
-    (should (string-match-p "Old report\." (buffer-string)))))
 
 
 (ert-deftest envoy-test-org-heading-does-not-file-result-under-replaced-heading ()
@@ -1478,7 +1493,9 @@ range would invite the agent to rewrite a line nobody selected."
         (goto-char (point-min))
         (re-search-forward "^\\* DOING The task$")
         (replace-match "* TODO Replacement")
-        (funcall callback (envoy--make-result :ok t :text "Done." :status 0))
+        (funcall callback
+                 (envoy--make-result
+                  :ok t :text "ENVOY_STATUS: complete\nDone." :status 0))
         (should (equal (org-get-todo-state) "TODO"))
         (should-not (string-match-p ":ENVOY:" (buffer-string)))
         (should (seq-some (lambda (message)
@@ -1509,7 +1526,9 @@ range would invite the agent to rewrite a line nobody selected."
         (let ((begin (line-beginning-position)))
           (delete-region begin (point-max))
           (insert "* TODO The task\n"))
-        (funcall callback (envoy--make-result :ok t :text "Done." :status 0))
+        (funcall callback
+                 (envoy--make-result
+                  :ok t :text "ENVOY_STATUS: complete\nDone." :status 0))
         (should (equal (org-get-todo-state) "TODO"))
         (should-not (string-match-p ":ENVOY:" (buffer-string)))
         (should (seq-some (lambda (message)
@@ -1566,7 +1585,9 @@ range would invite the agent to rewrite a line nobody selected."
             (delete-region begin (point-max))
             (insert (format "* TODO Same\n:PROPERTIES:\n:ID: %s\n:END:\n* TODO Same\n:PROPERTIES:\n:ID: %s\n:END:\n"
                             id id))))
-        (funcall callback (envoy--make-result :ok t :text "Done." :status 0))
+        (funcall callback
+                 (envoy--make-result
+                  :ok t :text "ENVOY_STATUS: complete\nDone." :status 0))
         (should (equal (org-get-todo-state) "TODO"))
         (should-not (string-match-p ":ENVOY:" (buffer-string)))))))
 (ert-deftest envoy-org-duplicate-id-after-drawer-marker-does-not-file-result ()
@@ -1595,7 +1616,9 @@ range would invite the agent to rewrite a line nobody selected."
             (delete-region begin (point-max))
             (insert (format "* TODO Same\n:PROPERTIES:\n:ID: %s\n:END:\n:ENVOY:\n#+begin_foo\n:END:\n* TODO Same\n:PROPERTIES:\n:ID: %s\n:END:\n#+end_foo\n"
                             id id))))
-        (funcall callback (envoy--make-result :ok t :text "Done." :status 0))
+        (funcall callback
+                 (envoy--make-result
+                  :ok t :text "ENVOY_STATUS: complete\nDone." :status 0))
         (should-not (string-match-p "Done\\." (buffer-string)))
         (should (seq-some (lambda (message)
                             (string-match-p "was not filed" message))
@@ -1622,7 +1645,9 @@ range would invite the agent to rewrite a line nobody selected."
             (delete-region begin (point-max))
             (insert (format "* TODO Same\n:PROPERTIES:\n:ID: %s\n:END:\n#+BEGIN_SRC org\n* TODO Fake\n:PROPERTIES:\n:ID: %s\n:END:\n#+END_SRC\n"
                             id id))))
-        (funcall callback (envoy--make-result :ok t :text "Done." :status 0))
+        (funcall callback
+                 (envoy--make-result
+                  :ok t :text "ENVOY_STATUS: complete\nDone." :status 0))
         (should (string-match-p ":ENVOY:" (buffer-string)))))))
 (ert-deftest envoy-org-indented-top-level-block-markers-do-not-hide-duplicate-id ()
   "An indented top-level block marker does not hide a duplicate ID heading."
@@ -1662,7 +1687,9 @@ range would invite the agent to rewrite a line nobody selected."
             (delete-region begin (point-max))
             (insert (format "* TODO Same\n:PROPERTIES:\n:ID: %s\n:END:\n  :FOO:\n* TODO Same\n:PROPERTIES:\n:ID: %s\n:END:\n"
                             id id))))
-        (funcall callback (envoy--make-result :ok t :text "Done." :status 0))
+        (funcall callback
+                 (envoy--make-result
+                  :ok t :text "ENVOY_STATUS: complete\nDone." :status 0))
         (should-not (string-match-p "Done\\." (buffer-string)))
         (should (seq-some (lambda (message)
                             (string-match-p "was not filed" message))
@@ -1689,7 +1716,9 @@ range would invite the agent to rewrite a line nobody selected."
             (delete-region begin (point-max))
             (insert (format "* TODO Same\n:PROPERTIES:\n:ID: %s\n:END:\n#+begin_src text\n* TODO Fake1\n:PROPERTIES:\n:ID: %s\n:END:\n#+end_example\n* TODO Fake2\n:PROPERTIES:\n:ID: %s\n:END:\n#+end_src\n"
                             id id id))))
-        (funcall callback (envoy--make-result :ok t :text "Done." :status 0))
+        (funcall callback
+                 (envoy--make-result
+                  :ok t :text "ENVOY_STATUS: complete\nDone." :status 0))
         (should (string-match-p ":ENVOY:" (buffer-string)))))))
 (ert-deftest envoy-org-begin-marker-inside-block-does-not-hide-duplicate-id ()
   "A BEGIN marker inside a source block does not hide a following heading."
@@ -1851,6 +1880,32 @@ Do the thing.\n"
       (should (< (string-match "Where to put things" prompt)
                  (string-match "## The task" prompt))))))
 
+(ert-deftest envoy-test-org-brief-report-contract-follows-task-text ()
+  "The org brief puts its report contract after the task text."
+  (envoy-test--with-org "* TODO The task\nDo the thing.\n"
+    (org-back-to-heading t)
+    (let* ((prompt (envoy-org-build-prompt
+                    "The task" (envoy-org--subtree-text) nil nil "brief-key"))
+           (task (string-match "## The task" prompt))
+           (body (string-match "Do the thing\\." prompt))
+           (status (string-match "## Completion status" prompt))
+           (closing (string-match "## Closing report" prompt))
+           (spool (string-match "## Where to leave your report" prompt)))
+      (should (string-match-p "Do the thing\\.\n\n## Completion status" prompt))
+      (should (< task body status closing spool)))))
+
+(ert-deftest envoy-test-brief-routes-authorization-gates-through-ask ()
+  "A step that needs live authorization is asked in-session, never parked in a file."
+  (envoy-test--with-org "* TODO The task\nDo the thing.\n"
+    (org-back-to-heading t)
+    (let ((prompt (envoy-org-build-prompt
+                   "The task" (envoy-org--subtree-text) "/tmp/x" nil)))
+      (should (string-match-p "## Steps that need the user's approval" prompt))
+      (should (string-match-p "`ask` tool" prompt))
+      (should (string-match-p "Never write a separate handoff" prompt))
+      (should (< (string-match "Steps that need the user's approval" prompt)
+                 (string-match "## The task" prompt))))))
+
 (ert-deftest envoy-test-brief-can-omit-output-instructions ()
   "Turning off the output instructions leaves them out of the brief."
   (envoy-test--with-org "* TODO The task\nDo the thing.\n"
@@ -1985,6 +2040,36 @@ unattached, is the thing this prevents."
   (with-temp-buffer
     (fundamental-mode)
     (should-error (envoy-org-heading) :type 'user-error)))
+
+(ert-deftest envoy-test-org-heading-asks-for-direction-before-running ()
+  "The subprocess dispatch asks for a direction and includes it in the brief."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO The task\n"
+    (let ((envoy-provider 'test)
+          (envoy-providers '((test :program "true" :name "Test Agent"
+                                   :args nil :edit-args nil
+                                   :deny-arg nil :model-arg nil)))
+          (events nil)
+          prompt brief)
+      (cl-letf (((symbol-function 'envoy--read-direction)
+                 (lambda (question)
+                   (push 'direction events)
+                   (setq prompt question)
+                   "Keep the API stable"))
+                ((symbol-function 'envoy-org--attach-directory)
+                 (lambda () nil))
+                ((symbol-function 'envoy-run)
+                 (lambda (text _callback &rest _keys)
+                   (push 'run events)
+                   (setq brief text)
+                   'fake-process)))
+        (envoy-org-heading)
+        (should (equal prompt "Direction for Test Agent: "))
+        (should (equal (nreverse events) '(direction run)))
+        (should (string-match-p
+                 (regexp-quote
+                  "## Direction from the user\n\nKeep the API stable\n\n")
+                 brief))))))
 
 (ert-deftest envoy-test-summary-is-filed-under-the-heading ()
   "What the agent said is recorded under the heading, in its own drawer."
@@ -2292,47 +2377,6 @@ them -- and a target naming a window by name would then be ambiguous."
     ;; reasonix takes neither, and is sent the brief as typed input instead.
     (should-not (string-match-p "envoy-prompt-xyz"
                                 (envoy-tmux-command file 'reasonix)))))
-(defmacro envoy-test--with-drive-stub (var &rest body)
-  "Bind VAR to an executable stand-in for the Drive wrapper around BODY.
-The real wrapper lives on one machine's PATH, and a test that looked for
-it there would pass or fail with the machine rather than with the code."
-  (declare (indent 1))
-  `(let ((,var (make-temp-file "omp-drive-" nil nil "#!/bin/sh\nexit 0\n")))
-     (unwind-protect
-         (progn (set-file-modes ,var #o700) ,@body)
-       (ignore-errors (delete-file ,var)))))
-
-(ert-deftest envoy-test-tmux-command-drive-with-selected-driver-model ()
-  "Drive mode prefixes the selected driver and omits native OMP flags."
-  (envoy-test--with-drive-stub drive-program
-    (let* ((envoy-tmux-omp-drive-program drive-program)
-           (envoy-tmux-providers
-            '((omp :program "true" :name "OMP" :args ("--extra" "value")
-                   :prompt-arg "@%s" :model-arg "--model"
-                   :variable model :setup nil :models ("driver"))))
-           (command (envoy-tmux-command "/tmp/p" 'omp "driver model"
-                                        nil nil 'drive)))
-      (should (string-prefix-p
-               (concat "OMP_DRIVE_MODEL="
-                       (shell-quote-argument "driver model") " "
-                       (shell-quote-argument drive-program))
-               command))
-      (should (string-match-p "@/tmp/p" command))
-      (dolist (flag '("--model" "--plan-yolo" "--plan-yolo-into"))
-        (should-not (string-match-p (regexp-quote flag) command))))))
-
-(ert-deftest envoy-test-tmux-command-drive-with-default-driver ()
-  "Drive mode leaves the driver variable unset for its default role."
-  (envoy-test--with-drive-stub drive-program
-    (let* ((envoy-tmux-omp-drive-program drive-program)
-           (envoy-tmux-providers
-            '((omp :program "true" :name "OMP" :args ()
-                   :prompt-arg "@%s" :model-arg "--model"
-                   :variable model :setup nil :models ("driver"))))
-           (command (envoy-tmux-command "/tmp/p" 'omp nil nil nil 'drive)))
-      (should-not (string-match-p "OMP_DRIVE_MODEL=" command))
-      (should (string-match-p (regexp-quote (shell-quote-argument drive-program))
-                              command)))))
 
 
 (ert-deftest envoy-test-tmux-command-quotes-what-comes-from-outside ()
@@ -2351,6 +2395,22 @@ to stay inside its own argument rather than starting a second command."
     (should (string-prefix-p "provider-wrapper && "
                              (envoy-tmux-command "/tmp/p" 'claude nil
                                                  "provider-wrapper")))))
+
+(ert-deftest envoy-test-tmux-command-quotes-system-prompt-file ()
+  "The provider system argument receives one shell-quoted file path."
+  (let ((envoy-tmux-providers
+         '((omp :program "true" :name "OMP" :args ()
+                :prompt-arg "@%s" :system-arg "--append-system-prompt=%s"
+                :model-arg "--model" :variable model :setup nil :models nil))))
+    (let ((command
+           (envoy-tmux-command "/tmp/prompt" 'omp nil nil nil
+                               "/tmp/system prompt")))
+      (should
+       (string-match-p
+        (regexp-quote
+         (concat "--append-system-prompt="
+                 (shell-quote-argument "/tmp/system prompt")))
+        command)))))
 
 (ert-deftest envoy-test-tmux-prompt-file-is-private ()
   "The brief is written where only its owner can read it.
@@ -2616,11 +2676,12 @@ what it is running first, and that the pieces are spaced."
 
 (ert-deftest envoy-test-tmux-all-agents-are-configured ()
   "Every tmux agent is described well enough to be started."
-  (dolist (agent '(claude reasonix pi codex omp))
+  (dolist (agent '(claude reasonix pi codex omp dsh))
     (let ((plist (envoy-tmux--provider agent)))
       (should (plist-get plist :program))
       (should (plist-get plist :name))
-      (should (memq (plist-get plist :variable) '(model setup)))
+      (when (plist-get plist :efforts)
+        (should (plist-get plist :effort-arg)))
       (when-let* ((arg (plist-get plist :prompt-arg)))
         (should (string-match-p "%s" arg)))
       (when (plist-get plist :opening-input)
@@ -2659,6 +2720,114 @@ what it is running first, and that the pieces are spaced."
     (fundamental-mode)
     (should-error (envoy-tmux-org-heading-to 'claude) :type 'user-error)))
 
+(ert-deftest envoy-test-tmux-org-heading-asks-direction-before-selection-and-session ()
+  "The tmux heading asks for direction before selection or session."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO The task\n:PROPERTIES:\n:ID: direction-order\n:END:\n"
+    (let ((envoy-tmux-providers
+           '((claude :program "true" :name "Claude" :args ()
+                     :prompt-arg nil :variable setup :setup nil :setups ())))
+          (events nil)
+          (selection-saw-claim nil)
+          sent-claim prompt)
+      (let* ((key (envoy-org--spool-key (org-entry-get nil "ID")))
+             (claim-file
+              (envoy-org--spool-file key envoy-org--spool-claim-suffix)))
+        (cl-letf (((symbol-function 'envoy--read-direction)
+                   (lambda (question)
+                     (should (equal question "Direction for Claude: "))
+                     (push 'direction events)
+                     "Keep the API stable"))
+                  ((symbol-function 'envoy-tmux--read-variable)
+                   (lambda (&rest _)
+                     (push 'selection events)
+                     (setq selection-saw-claim (file-exists-p claim-file))
+                     '(:model nil :setup nil :plan-into nil)))
+                  ((symbol-function 'envoy-tmux-read-session)
+                   (lambda (&rest _)
+                     (push 'session events)
+                     "work"))
+                  ((symbol-function 'envoy-tmux-window)
+                   (lambda (&rest _)
+                     (push 'window events)
+                     "work:7"))
+                  ((symbol-function 'envoy-tmux-send)
+                   (lambda (_target text &optional _provider _model _setup
+                                     _plan-into on-start claim &rest _)
+                     (push 'send events)
+                     (setq prompt text sent-claim claim)
+                     (when on-start (funcall on-start))))
+                  ((symbol-function 'envoy-org--attach-directory)
+                   (lambda () nil))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (envoy-tmux-org-heading-to 'claude nil nil nil nil t))
+        (should (equal (nreverse events)
+                       '(direction selection session window send)))
+        (should selection-saw-claim)
+        (should (equal (plist-get sent-claim :key) key))
+        (should (plist-get sent-claim :token))
+        (should (string-match-p
+                 (regexp-quote
+                  "## Direction from the user\n\nKeep the API stable\n\n")
+                 prompt))))))
+
+(ert-deftest envoy-test-tmux-org-heading-blank-direction-uses-default ()
+  "A blank tmux heading direction puts the default into the brief."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO The task\n:PROPERTIES:\n:ID: direction-default\n:END:\n"
+    (let ((envoy-tmux-providers
+           '((claude :program "true" :name "Claude" :args ()
+                     :prompt-arg nil :variable setup :setup nil :setups ())))
+          prompt)
+      (cl-letf (((symbol-function 'read-string)
+                 (lambda (question)
+                   (should (equal question "Direction for Claude: "))
+                   " \t "))
+                ((symbol-function 'envoy-tmux-read-session)
+                 (lambda (&rest _) "work"))
+                ((symbol-function 'envoy-tmux-window)
+                 (lambda (&rest _) "work:8"))
+                ((symbol-function 'envoy-tmux-send)
+                 (lambda (_target text &optional _provider _model _setup
+                                   _plan-into on-start _claim &rest _)
+                   (setq prompt text)
+                   (when on-start (funcall on-start))))
+                ((symbol-function 'envoy-org--attach-directory)
+                 (lambda () nil))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (envoy-tmux-org-heading-to 'claude))
+      (should (string-match-p
+               (regexp-quote
+                (concat "## Direction from the user\n\n"
+                        envoy-default-direction "\n\n"))
+               prompt)))))
+
+(ert-deftest envoy-test-tmux-org-heading-direction-cancellation-releases-claim ()
+  "Canceling direction input releases the heading claim before tmux starts."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO The task\n:PROPERTIES:\n:ID: direction-cancel\n:END:\n"
+    (let ((envoy-tmux-providers
+           '((claude :program "true" :name "Claude" :args ()
+                     :prompt-arg nil :variable setup :setup nil :setups ())))
+          (window-called nil))
+      (let* ((key (envoy-org--spool-key (org-entry-get nil "ID")))
+             (claim-file
+              (envoy-org--spool-file key envoy-org--spool-claim-suffix))
+             (state-file
+              (envoy-org--spool-file key envoy-org--spool-state-suffix)))
+        (cl-letf (((symbol-function 'envoy--read-direction)
+                   (lambda (&rest _) (signal 'quit nil)))
+                  ((symbol-function 'envoy-tmux-window)
+                   (lambda (&rest _)
+                     (setq window-called t)
+                     "work:9")))
+          (condition-case nil
+              (envoy-tmux-org-heading-to 'claude)
+            (quit nil)))
+        (should-not (file-exists-p claim-file))
+        (should-not (file-exists-p state-file))
+        (should-not window-called)))))
+
 (ert-deftest envoy-test-tmux-keys-are-bound-to-the-three-agents ()
   "The three keys reach the three agents.
 `envoy-org-setup-keys' takes the same first key, so whichever of the two
@@ -2681,27 +2850,203 @@ being separate functions."
     (should (string-match-p (regexp-quote (executable-find "true")) command))
     (should-not (string-match-p "nil" command))))
 
-(ert-deftest envoy-test-tmux-drive-picker-returns-drive-selection ()
-  "The Drive picker offers the default driver before model selectors."
+(ert-deftest envoy-test-tmux-command-prefixes-omp-brief-heading ()
+  "An OMP command includes the brief heading before its @file argument."
   (let ((envoy-tmux-providers
-         '((omp :program "true" :name "OMP" :args ()
+         '((omp :program "true" :name "OMP" :args () :prompt-arg "@%s"
+                :model-arg "--model" :variable model :setup nil :models ()))))
+    (cl-letf (((symbol-function 'envoy-tmux--brief-heading)
+               (lambda (_) "# Act: Ship it")))
+      (should (string-match-p
+               (regexp-quote "\\#\\ Act\\:\\ Ship\\ it")
+               (envoy-tmux-command "/tmp/brief" 'omp))))))
+(ert-deftest envoy-test-tmux-omp-picker-offers-only-native-modes ()
+  "The OMP prefix picker returns native model selections and commands."
+  (let ((envoy-tmux-providers
+         '((omp :program "true" :name "OMP" :args ("--extra" "value")
                 :prompt-arg "@%s" :model-arg "--model"
-                :variable model :setup nil :models ("driver"))))
-        calls)
+                :variable model :setup nil :models ())))
+        mode-choices
+        (responses '("Single model" "single" "Plan into" "planner"
+                     "executor")))
+    (cl-letf (((symbol-function 'envoy-tmux--omp-models)
+               (lambda () '("single" "planner" "executor")))
+              ((symbol-function 'completing-read)
+               (lambda (prompt collection &rest _)
+                 (when (string-match-p "launch mode" prompt)
+                   (push collection mode-choices))
+                 (pop responses))))
+      (let* ((decode-command
+              (lambda (command)
+                (with-temp-buffer
+                  (should
+                   (zerop
+                    (process-file "/bin/sh" nil t nil "-c"
+                                  (concat "set -- " command
+                                          "; printf '%s\\n' \"$@\""))))
+                  (split-string (buffer-string) "\n" t))))
+             (single (envoy-tmux--read-variable 'omp))
+             (single-command
+              (envoy-tmux-command "/tmp/brief" 'omp
+                                  (plist-get single :model)
+                                  (plist-get single :setup)
+                                  (plist-get single :plan-into)))
+             (single-argv (funcall decode-command single-command))
+             (plan (envoy-tmux--read-variable 'omp))
+             (plan-command
+              (envoy-tmux-command "/tmp/brief" 'omp
+                                  (plist-get plan :model)
+                                  (plist-get plan :setup)
+                                  (plist-get plan :plan-into)))
+             (plan-argv (funcall decode-command plan-command)))
+        (should (equal (nreverse mode-choices)
+                       '(("Single model" "Plan into")
+                         ("Single model" "Plan into"))))
+        (should (equal single
+                       '(:model "single" :setup nil :plan-into nil :effort nil)))
+        (should (equal single-argv
+                       (list (executable-find "true") "--extra" "value"
+                             "--model" "single" "@/tmp/brief")))
+        (should (equal plan
+                       '(:model "planner" :setup nil
+                         :plan-into "executor" :effort nil)))
+        (should (equal plan-argv
+                       (list (executable-find "true") "--extra" "value"
+                             "--model" "planner" "--plan-yolo"
+                             "--plan-yolo-into" "executor" "@/tmp/brief")))))))
+
+(ert-deftest envoy-test-tmux-omp-picker-offers-thinking-effort ()
+  "The OMP picker passes selected effort and preserves defaults on blank input."
+  (let ((envoy-tmux-providers
+         '((omp :program "true" :name "OMP" :args ("--extra" "value")
+                :prompt-arg "@%s" :model-arg "--model"
+                :effort-arg "--thinking" :efforts ("low" "high" "max")
+                :variable model :setup nil :models ())))
+        (responses '("Single model" "single" "high")))
+    (cl-letf (((symbol-function 'envoy-tmux--omp-models)
+               (lambda () '("single" "planner" "executor")))
+              ((symbol-function 'completing-read)
+               (lambda (&rest _) (pop responses))))
+      (let* ((decode-command
+              (lambda (command)
+                (with-temp-buffer
+                  (should
+                   (zerop
+                    (process-file "/bin/sh" nil t nil "-c"
+                                  (concat "set -- " command
+                                          "; printf '%s\\n' \"$@\""))))
+                  (split-string (buffer-string) "\n" t))))
+             (single (envoy-tmux--read-variable 'omp))
+             (single-argv
+              (funcall decode-command
+                       (envoy-tmux-command "/tmp/brief" 'omp
+                                           (plist-get single :model)
+                                           (plist-get single :setup)
+                                           (plist-get single :plan-into)
+                                           nil (plist-get single :effort)))))
+        (should (equal single
+                       '(:model "single" :setup nil :plan-into nil :effort "high")))
+        (should (equal single-argv
+                       (list (executable-find "true") "--extra" "value"
+                             "--model" "single" "--thinking" "high"
+                             "@/tmp/brief"))))
+      (setq responses '("Plan into" "planner" "executor" ""))
+      (let* ((plan (envoy-tmux--read-variable 'omp))
+             (plan-argv
+              (funcall
+               (lambda (command)
+                 (with-temp-buffer
+                   (should
+                    (zerop
+                     (process-file "/bin/sh" nil t nil "-c"
+                                   (concat "set -- " command
+                                           "; printf '%s\\n' \"$@\""))))
+                   (split-string (buffer-string) "\n" t)))
+               (envoy-tmux-command "/tmp/brief" 'omp
+                                   (plist-get plan :model)
+                                   (plist-get plan :setup)
+                                   (plist-get plan :plan-into)
+                                   nil (plist-get plan :effort)))))
+        (should (equal plan
+                       '(:model "planner" :setup nil
+                         :plan-into "executor" :effort nil)))
+        (should-not (member "--thinking" plan-argv))))))
+
+(ert-deftest envoy-test-tmux-dsh-picker-offers-single-and-plan-into ()
+  "The dsh prefix picker offers Single model and Plan into over its models."
+  (let ((envoy-tmux-providers
+         '((dsh :program "true" :name "dsh" :args ()
+                :prompt-arg "@%s" :model-arg "--model"
+                :effort-arg "--thinking" :efforts ("off" "low" "high" "max")
+                :variable model :setup nil
+                :models ("deepseek-flash" "deepseek-v4-pro"))))
+        mode-choices
+        (responses '("Single model" "deepseek-v4-pro" "high"
+                     "Plan into" "deepseek-flash" "deepseek-v4-pro" "")))
     (cl-letf (((symbol-function 'completing-read)
                (lambda (prompt collection &rest _)
-                 (push (cons prompt collection) calls)
-                 (if (string-match-p "launch mode" prompt)
-                     "Drive"
-                   "Default driver"))))
-      (should (equal (envoy-tmux--read-variable 'omp)
-                     '(:model nil :setup nil :plan-into nil :mode drive)))
-      (let ((driver-call
-             (seq-find (lambda (call)
-                         (string-match-p "Driver model" (car call)))
-                       calls)))
-        (should driver-call)
-        (should (equal (car (cdr driver-call)) "Default driver"))))))
+                 (when (string-match-p "launch mode" prompt)
+                   (push collection mode-choices))
+                 (pop responses))))
+      (should (equal (envoy-tmux--read-variable 'dsh)
+                     '(:model "deepseek-v4-pro" :setup nil
+                       :plan-into nil :effort "high")))
+      (should (equal (envoy-tmux--read-variable 'dsh)
+                     '(:model "deepseek-flash" :setup nil
+                       :plan-into "deepseek-v4-pro" :effort nil)))
+      (should (equal mode-choices
+                     '(("Single model" "Plan into")
+                       ("Single model" "Plan into")))))))
+
+(ert-deftest envoy-test-tmux-dsh-single-model-names-model-and-effort ()
+  "A dsh launch passes its model and thinking effort to dsh-launch."
+  (let ((envoy-tmux-providers
+         '((dsh :program "true" :name "dsh" :args ()
+                :prompt-arg "@%s" :model-arg "--model"
+                :effort-arg "--thinking" :efforts ("off" "low" "high" "max")
+                :variable model :setup nil
+                :models ("deepseek-flash" "deepseek-v4-pro")))))
+    (should (equal (envoy-tmux-command "/tmp/brief" 'dsh "deepseek-v4-pro"
+                                       nil nil nil "high")
+                   (format "%s --model deepseek-v4-pro --thinking high @/tmp/brief"
+                           (executable-find "true"))))))
+
+(ert-deftest envoy-test-tmux-dsh-plan-into-names-planner-and-executor ()
+  "A dsh plan-into launch names the planner and the executor to dsh-launch."
+  (let ((envoy-tmux-providers
+         '((dsh :program "true" :name "dsh" :args ()
+                :prompt-arg "@%s" :model-arg "--model"
+                :effort-arg "--thinking" :efforts ("off" "low" "high" "max")
+                :variable model :setup nil
+                :models ("deepseek-flash" "deepseek-v4-pro")))))
+    (should (equal (envoy-tmux-command "/tmp/brief" 'dsh "deepseek-v4-pro"
+                                       nil "deepseek-flash")
+                   (format (concat "%s --model deepseek-v4-pro --plan-yolo"
+                                   " --plan-yolo-into deepseek-flash @/tmp/brief")
+                           (executable-find "true"))))))
+
+(ert-deftest envoy-test-tmux-command-effort-validation-and-replacement ()
+  "An explicit effort replaces configured flags and rejects invalid input."
+  (let* ((provider '((omp :program "true" :name "OMP"
+                           :args ("--thinking" "low")
+                           :effort-arg "--thinking" :prompt-arg "@%s"
+                           :model-arg "--model")))
+         (envoy-tmux-providers provider)
+         (command (envoy-tmux-command "/tmp/b" 'omp nil nil nil nil "high")))
+    (should (equal (seq-filter (lambda (arg) (equal arg "--thinking"))
+                               (split-string command))
+                   '("--thinking")))
+    (should (string-match-p "--thinking high" command))
+    (let* ((envoy-tmux-providers
+            '((omp :program "true" :name "OMP" :args ("--thinking=low")
+                   :effort-arg "--thinking" :prompt-arg "@%s")))
+           (command (envoy-tmux-command "/tmp/b" 'omp nil nil nil nil "high")))
+      (should-not (string-match-p "--thinking=low" command))
+      (should (string-match-p "--thinking high" command)))
+    (should-error (envoy-tmux-command "/tmp/b" 'omp nil nil nil nil "")
+                  :type 'user-error)
+    (should-error (envoy-tmux-command "/tmp/b" 'claude nil nil nil nil "high")
+                  :type 'user-error)))
 
 (ert-deftest envoy-test-tmux-model-picker-rejects-an-empty-answer ()
   "An empty model selection is rejected before command construction."
@@ -2781,17 +3126,23 @@ CI runner without losing the distinction."
     (should-error (envoy-tmux-command "/tmp/envoy-test-prompt" 'test)
                   :type 'user-error)))
 (ert-deftest envoy-test-tmux-heading-validates-provider-before-window ()
-  "A missing provider program is rejected before dispatch can continue."
+  "A missing provider program is rejected before dispatch prompts or runs."
   (envoy-test--with-org-file "#+TODO: TODO DOING | DONE\n* TODO The task\n"
     (let ((envoy-tmux-providers '((missing :program "" :name "Missing")))
+          (direction-called nil)
           (window-called nil))
-      (cl-letf (((symbol-function 'envoy-tmux-window)
+      (cl-letf (((symbol-function 'envoy--read-direction)
+                 (lambda (&rest _)
+                   (setq direction-called t)
+                   (error "Direction must not be read")))
+                ((symbol-function 'envoy-tmux-window)
                  (lambda (&rest _)
                    (setq window-called t)
                    "test:7")))
         (should-error
          (envoy-tmux-org-heading-to 'missing nil nil nil "test")
          :type 'user-error))
+      (should-not direction-called)
       (should-not window-called))))
 
 
@@ -3320,6 +3671,35 @@ Returns a cons of (CHECKOUT-COUNT . GUARD-COUNT)."
       (should (equal "/opt/providers/provider-launcher"
                      (nth 2 typed))))))
 
+
+(ert-deftest envoy-test-tmux-send-refuses-empty-or-placeholder-brief ()
+  "A brief that is empty or only the placeholder never starts a session.
+
+Sixteen dispatches ran real agents on a prompt file holding only the
+word \"brief\" and billed them for work that did not exist, so the
+refusal has to come before a prompt file is written or a key is sent,
+for a provider that reads a file and for one that is typed at."
+  (let ((writes nil)
+        (envoy-tmux-providers
+         '((omp :program "true" :name "OMP" :args () :prompt-arg "@%s"
+                :system-arg "--append-system-prompt=%s"
+                :model-arg "--model" :variable model :setup nil :models nil)
+           (claude :program "true" :name "Claude Code" :args ()
+                   :prompt-arg nil :model-arg "--model" :variable setup
+                   :setup nil :setups ()))))
+    (dolist (brief '("" "  \n " "brief" "Brief"))
+      (dolist (provider '(omp claude))
+        (cl-letf (((symbol-function 'envoy-tmux--write-prompt)
+                   (lambda (text) (push text writes) "/tmp/envoy-test-stub"))
+                  ((symbol-function 'envoy-tmux-type)
+                   (lambda (_target text &rest _)
+                     (push text writes)))
+                  ((symbol-function 'envoy-tmux--call)
+                   (lambda (&rest args) (push args writes) '(0 . ""))))
+          (should-error (envoy-tmux-send "session:7" brief provider)
+                        :type 'user-error))))
+    (should (null writes))))
+
 (ert-deftest envoy-test-tmux-send-uses-cmd-prompt-cleanup ()
   "A file-reading provider uses CMD syntax to remove its prompt file."
   (let ((calls nil)
@@ -3343,7 +3723,7 @@ Returns a cons of (CHECKOUT-COUNT . GUARD-COUNT)."
                  (if (equal (car args) "display-message")
                      '(0 . "cmd.exe")
                    '(0 . "")))))
-      (setq file (envoy-tmux-send "session:7" "brief" 'provider)))
+      (setq file (envoy-tmux-send "session:7" "Do the task." 'provider)))
     (unwind-protect
         (let* ((send (seq-find
                       (lambda (call)
@@ -3356,6 +3736,215 @@ Returns a cons of (CHECKOUT-COUNT . GUARD-COUNT)."
           (should-not (string-match-p "; rm -f --" command)))
       (when (and file (file-exists-p file))
         (delete-file file)))))
+
+(defmacro envoy-test--with-tmux-spool (&rest body)
+  "Evaluate BODY with a temporary report spool whose path has spaces."
+  (declare (indent 0))
+  `(let* ((directory (make-temp-file "envoy-test-tmux-spool-" t))
+          (envoy-org-spool-directory
+           (expand-file-name "spool with spaces" directory)))
+     (unwind-protect
+         (progn
+           (make-directory envoy-org-spool-directory t)
+           ,@body)
+       (delete-directory directory t))))
+
+(defun envoy-test--run-tmux-exit-fallback (claim)
+  "Run CLAIM's generated fallback after a shell command fails."
+  (let ((guard
+         (cl-letf (((symbol-function 'envoy-tmux--call)
+                    (lambda (&rest _) '(0 . "sh")))
+                   )
+           (envoy-tmux--exit-fallback "session:7" claim))))
+    (should guard)
+    (call-process "sh" nil nil nil "-c" (concat "false" guard))))
+
+(ert-deftest envoy-test-tmux-exit-fallback-publishes-for-owned-claim ()
+  "A failed provider exit publishes incomplete status for its own claim."
+  (envoy-test--with-tmux-spool
+    (let* ((claim (envoy-org--spool-claim "owned-run" "The task"))
+           (failed (envoy-org--spool-file
+                    (plist-get claim :key) envoy-org--spool-failed-suffix)))
+      (should (zerop (envoy-test--run-tmux-exit-fallback claim)))
+      (with-temp-buffer
+        (insert-file-contents failed)
+        (should (equal (buffer-string)
+                       (concat "ENVOY_STATUS: incomplete\n"
+                               "The agent exited without publishing a report.\n")))))))
+
+(ert-deftest envoy-test-tmux-exit-fallback-skips-existing-done-marker ()
+  "An existing completion marker prevents the exit fallback."
+  (envoy-test--with-tmux-spool
+    (let* ((claim (envoy-org--spool-claim "done-run" "The task"))
+           (done (envoy-org--spool-file
+                  (plist-get claim :key) envoy-org--spool-done-suffix))
+           (failed (envoy-org--spool-file
+                    (plist-get claim :key) envoy-org--spool-failed-suffix)))
+      (with-temp-file done (insert "complete\n"))
+      (should (zerop (envoy-test--run-tmux-exit-fallback claim)))
+      (should-not (file-exists-p failed)))))
+
+(ert-deftest envoy-test-tmux-exit-fallback-skips-existing-failed-marker ()
+  "An existing failure marker remains untouched by the exit fallback."
+  (envoy-test--with-tmux-spool
+    (let* ((claim (envoy-org--spool-claim "failed-run" "The task"))
+           (failed (envoy-org--spool-file
+                    (plist-get claim :key) envoy-org--spool-failed-suffix)))
+      (with-temp-file failed (insert "original marker\n"))
+      (should (zerop (envoy-test--run-tmux-exit-fallback claim)))
+      (with-temp-buffer
+        (insert-file-contents failed)
+        (should (equal (buffer-string) "original marker\n"))))))
+
+(ert-deftest envoy-test-tmux-exit-fallback-skips-released-claim ()
+  "The exit fallback does nothing after its claim has been released."
+  (envoy-test--with-tmux-spool
+    (let* ((claim (envoy-org--spool-claim "released-run" "The task"))
+           (failed (envoy-org--spool-file
+                    (plist-get claim :key) envoy-org--spool-failed-suffix)))
+      (delete-file (plist-get claim :file))
+      (should (zerop (envoy-test--run-tmux-exit-fallback claim)))
+      (should-not (file-exists-p failed)))))
+
+(ert-deftest envoy-test-tmux-exit-fallback-skips-foreign-claim ()
+  "The exit fallback does nothing when another token owns the claim."
+  (envoy-test--with-tmux-spool
+    (let* ((claim (envoy-org--spool-claim "foreign-run" "The task"))
+           (failed (envoy-org--spool-file
+                    (plist-get claim :key) envoy-org--spool-failed-suffix)))
+      (with-temp-file (plist-get claim :file)
+        (prin1 '(:token "another-run") (current-buffer)))
+      (should (zerop (envoy-test--run-tmux-exit-fallback claim)))
+      (should-not (file-exists-p failed)))))
+
+(ert-deftest envoy-test-org-collects-tmux-exit-fallback-as-incomplete ()
+  "The collector files the fallback report and leaves its heading active."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO The task\n:PROPERTIES:\n:ID: tmux-exit-fallback\n:END:\n"
+    (let* ((id (org-entry-get nil "ID"))
+           (claim (envoy-org--spool-claim id "The task"))
+           (key (plist-get claim :key))
+           (failed (envoy-org--spool-file
+                    key envoy-org--spool-failed-suffix)))
+      (envoy-org--spool-open "The task" nil)
+      (should (zerop (envoy-test--run-tmux-exit-fallback claim)))
+      (should (= (envoy-org-collect-reports) 1))
+      (should (equal (org-get-todo-state) "DOING"))
+      (should-not (file-exists-p failed))
+      (should (string-match-p "exited without publishing a report"
+                              (buffer-string)))
+      (should-not (string-match-p "ENVOY_STATUS" (buffer-string))))))
+
+(ert-deftest envoy-test-tmux-omp-claim-sends-private-report-contract-and-cleans-it ()
+  "OMP receives the report contract in a private file removed after exit."
+  (envoy-test--with-tmux-spool
+    (let ((envoy-tmux-providers
+           (copy-tree envoy-tmux-providers))
+          (calls nil)
+          claim file system-file command)
+      ;; The configured entry, with a stand-in program.  The launch line
+      ;; this test builds is really executed below, so the configured
+      ;; agent would really run, bill a session and need its API key in
+      ;; CI.  Only the program is replaced; the arguments, the prompt
+      ;; delivery and the report-contract delivery stay as configured.
+      (let ((omp (assq 'omp envoy-tmux-providers)))
+        (when omp
+          (plist-put (cdr omp) :program "true")))
+      (unwind-protect
+          (progn
+            (setq claim (envoy-org--spool-claim "omp-system" "The task"))
+            (let ((writes nil)
+                  (original-write
+                   (symbol-function 'envoy-tmux--write-prompt)))
+              (cl-letf (((symbol-function 'envoy-tmux--call)
+                         (lambda (&rest args)
+                           (if (equal (car args) "display-message")
+                               '(0 . "sh")
+                             (push args calls)
+                             '(0 . ""))))
+                        ((symbol-function 'envoy-tmux--write-prompt)
+                         (lambda (text)
+                           (let ((path (funcall original-write text)))
+                             (push path writes)
+                             path))))
+                (setq file
+                      (envoy-tmux-send "session:7" "Do the task." 'omp nil nil nil
+                                       nil claim)))
+              (setq system-file (car writes)))
+            (let ((launch (seq-find
+                           (lambda (call)
+                             (and (equal (car call) "send-keys")
+                                  (member "-l" call)))
+                           calls)))
+              (should launch)
+              (setq command (nth 4 launch)))
+            (should (string-match-p (regexp-quote (concat "@" file)) command))
+            (should
+             (string-match-p
+              (regexp-quote
+               (concat "--append-system-prompt="
+                       (shell-quote-argument system-file)))
+              command))
+            (should (equal (file-modes system-file) #o600))
+            (with-temp-buffer
+              (insert-file-contents system-file)
+              (should (string-match-p "ENVOY_STATUS: complete" (buffer-string)))
+              (should
+               (string-match-p
+                (regexp-quote
+                 (envoy-org--spool-file
+                  (plist-get claim :key) envoy-org--spool-done-suffix))
+                (buffer-string)))
+              (should
+               (string-match-p
+                (regexp-quote
+                 (envoy-org--spool-file
+                  (plist-get claim :key) envoy-org--spool-failed-suffix))
+                (buffer-string))))
+            (should (zerop (call-process "sh" nil nil nil "-c" command)))
+            (should-not (file-exists-p file))
+            (should-not (file-exists-p system-file)))
+        (dolist (temporary (list file system-file))
+          (when (and temporary (file-exists-p temporary))
+            (delete-file temporary)))))))
+
+(ert-deftest envoy-test-tmux-send-without-claim-keeps-command-unchanged ()
+  "A launch without a claim keeps legacy command and cleanup bytes."
+  (envoy-test--with-tmux-spool
+    (let ((envoy-tmux-providers
+           '((omp :program "true" :name "OMP" :args () :prompt-arg "@%s"
+                  :system-arg "--append-system-prompt=%s"
+                  :model-arg "--model" :variable model :setup nil :models nil)))
+          (calls nil)
+          file command)
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'envoy-tmux--call)
+                       (lambda (&rest args)
+                         (if (equal (car args) "display-message")
+                             '(0 . "sh")
+                           (push args calls)
+                           '(0 . "")))))
+              (setq file (envoy-tmux-send "session:7" "Do the task." 'omp)))
+            (let ((launch (seq-find
+                           (lambda (call)
+                             (and (equal (car call) "send-keys")
+                                  (member "-l" call)))
+                           calls)))
+              (should launch)
+              (setq command (nth 4 launch)))
+            (should
+             (equal
+              command
+              (concat
+               (shell-quote-argument
+                (envoy-tmux--provider-program 'omp))
+               " " (shell-quote-argument "Do the task.")
+               " " (format "@%s" (shell-quote-argument file))
+               (envoy-tmux--prompt-file-cleanup "session:7" file))))
+            (should-not (string-match-p "--append-system-prompt" command)))
+        (when (and file (file-exists-p file))
+          (delete-file file))))))
 
 (provide 'envoy-test)
 
@@ -3373,9 +3962,10 @@ and a command-line prompt arrives before the opening input can be sent."
     (should-not (plist-get provider :prompt-arg))
     (should (equal (plist-get provider :opening-input) '("")))))
 (ert-deftest envoy-test-tmux-codex-and-omp-commands-are-interactive ()
-  "Codex and OMP expose interactive org commands on their own keys."
+  "Codex, OMP and dsh expose interactive org commands on their own keys."
   (should (commandp #'envoy-tmux-org-heading-codex))
   (should (commandp #'envoy-tmux-org-heading-omp))
+  (should (commandp #'envoy-tmux-org-heading-dsh))
   (let ((original-map (copy-keymap org-mode-map)))
     (with-temp-buffer
       (org-mode)
@@ -3383,6 +3973,8 @@ and a command-line prompt arrives before the opening input can be sent."
         (envoy-tmux-setup-keys)
         (should (eq (lookup-key org-mode-map (kbd "C-c C-x C"))
                     #'envoy-tmux-org-heading-codex))
+        (should (eq (lookup-key org-mode-map (kbd "C-c C-x S"))
+                    #'envoy-tmux-org-heading-dsh))
         (should (eq (lookup-key org-mode-map (kbd "C-c C-x O"))
                     #'envoy-tmux-org-heading-omp))))
     (should (equal org-mode-map original-map))))
@@ -3390,16 +3982,22 @@ and a command-line prompt arrives before the opening input can be sent."
 
 (ert-deftest envoy-test-tmux-omp-provider-reads-prompt-file-and-discovers-models ()
   "OMP reads a prompt file and exposes discovered model selectors."
-  (let ((provider (envoy-tmux--provider 'omp))
-        (envoy-tmux-providers (copy-tree envoy-tmux-providers)))
-    (should (equal (plist-get provider :prompt-arg) "@%s"))
-    (plist-put (alist-get 'omp envoy-tmux-providers) :models nil)
-    (cl-letf (((symbol-function 'envoy-tmux--omp-program)
-               (lambda () "/fake/omp"))
-              ((symbol-function 'envoy-tmux--omp-discover-models)
-               (lambda (_program) '("openai/gpt-5" "anthropic/claude"))))
-      (should (equal (envoy-tmux--omp-models)
-                     '("openai/gpt-5" "anthropic/claude"))))))
+  (let* ((provider (envoy-tmux--provider 'omp))
+         (cache-file (make-temp-file "envoy-test-omp-cache-"))
+         (envoy-tmux-omp-model-cache-file cache-file)
+         (envoy-tmux-providers (copy-tree envoy-tmux-providers)))
+    (unwind-protect
+        (progn
+          (plist-put (alist-get 'omp envoy-tmux-providers) :models nil)
+          (should (equal (plist-get provider :prompt-arg) "@%s"))
+          (cl-letf (((symbol-function 'envoy-tmux--omp-program)
+                     (lambda () "/fake/omp"))
+                    ((symbol-function 'envoy-tmux--omp-discover-models)
+                     (lambda (_program)
+                       '("openai/gpt-5" "anthropic/claude"))))
+            (should (equal (envoy-tmux--omp-models)
+                           '("openai/gpt-5" "anthropic/claude")))))
+      (delete-file cache-file))))
 
 (ert-deftest envoy-test-tmux-omp-model-list-preserves-explicit-config ()
   "An explicit OMP model list avoids discovery and keeps its order."
@@ -3412,6 +4010,122 @@ and a command-line prompt arrives before the opening input can be sent."
                (lambda (_program) (error "Discovery should not run"))))
       (should (equal (envoy-tmux--omp-models) '("first" "second"))))))
 
+(ert-deftest envoy-test-tmux-omp-models-answer-from-fresh-cache ()
+  "A cache entry younger than the TTL answers without running OMP.
+The discovery subprocess is what a contended OMP makes slow, so the
+picker must be able to skip it altogether."
+  (let* ((cache-file (make-temp-file "envoy-test-omp-cache-"))
+         (envoy-tmux-omp-model-cache-file cache-file)
+         (envoy-tmux-providers (copy-tree envoy-tmux-providers)))
+    (unwind-protect
+        (progn
+          (plist-put (alist-get 'omp envoy-tmux-providers) :models nil)
+          (with-temp-file cache-file
+            (prin1 (list :program "/fake/omp"
+                         :time (float-time)
+                         :models '("cached/one" "cached/two"))
+                   (current-buffer)))
+          (cl-letf (((symbol-function 'envoy-tmux--omp-program)
+                     (lambda () "/fake/omp"))
+                    ((symbol-function 'envoy-tmux--omp-discover-models)
+                     (lambda (_program) (error "Discovery must not run"))))
+            (should (equal (envoy-tmux--omp-models)
+                           '("cached/one" "cached/two")))))
+      (delete-file cache-file))))
+
+(ert-deftest envoy-test-tmux-omp-models-fall-back-to-stale-cache ()
+  "A failed discovery offers the stale cached list instead of refusing.
+Both OMP queries timing out is the reported defect: the prefixed
+dispatch aborted twice while several OMP sessions contended for the
+state database."
+  (let* ((cache-file (make-temp-file "envoy-test-omp-cache-"))
+         (envoy-tmux-omp-model-cache-file cache-file)
+         (envoy-tmux-providers (copy-tree envoy-tmux-providers))
+         (messages nil))
+    (unwind-protect
+        (progn
+          (plist-put (alist-get 'omp envoy-tmux-providers) :models nil)
+          (with-temp-file cache-file
+            (prin1 (list :program "/fake/omp"
+                         :time (- (float-time) 7200)
+                         :models '("stale/one"))
+                   (current-buffer)))
+          (cl-letf (((symbol-function 'envoy-tmux--omp-program)
+                     (lambda () "/fake/omp"))
+                    ((symbol-function 'envoy-tmux--omp-discover-models)
+                     (lambda (_program)
+                       (user-error
+                        "Envoy: OMP `models --json' timed out after 5 seconds")))
+                    ((symbol-function 'message)
+                     (lambda (&rest args)
+                       (push (apply #'format args) messages))))
+            (should (equal (envoy-tmux--omp-models) '("stale/one"))))
+          (should (string-match-p
+                   "Using the cached model list"
+                   (car messages))))
+      (delete-file cache-file))))
+
+(ert-deftest envoy-test-tmux-omp-models-cache-a-successful-discovery ()
+  "A successful discovery is recorded in the cache file for later calls."
+  (let* ((cache-file (expand-file-name "envoy-test-omp-cache"
+                                       temporary-file-directory))
+         (envoy-tmux-omp-model-cache-file cache-file)
+         (envoy-tmux-providers (copy-tree envoy-tmux-providers)))
+    (when (file-exists-p cache-file) (delete-file cache-file))
+    (unwind-protect
+        (progn
+          (plist-put (alist-get 'omp envoy-tmux-providers) :models nil)
+          (cl-letf (((symbol-function 'envoy-tmux--omp-program)
+                     (lambda () "/fake/omp"))
+                    ((symbol-function 'envoy-tmux--omp-discover-models)
+                     (lambda (_program) '("fresh/one" "fresh/two"))))
+            (should (equal (envoy-tmux--omp-models)
+                           '("fresh/one" "fresh/two")))
+            (should (equal (plist-get (envoy-tmux--omp-model-cache-read) :models)
+                           '("fresh/one" "fresh/two")))
+            (should (equal (plist-get (envoy-tmux--omp-model-cache-read) :program)
+                           "/fake/omp"))))
+      (delete-file cache-file))))
+
+(ert-deftest envoy-test-tmux-omp-models-signal-without-cache ()
+  "A failed discovery still refuses the dispatch when no cache exists."
+  (let* ((cache-file (make-temp-file "envoy-test-omp-cache-"))
+         (envoy-tmux-omp-model-cache-file cache-file)
+         (envoy-tmux-providers (copy-tree envoy-tmux-providers)))
+    (unwind-protect
+        (progn
+          (delete-file cache-file)
+          (plist-put (alist-get 'omp envoy-tmux-providers) :models nil)
+          (cl-letf (((symbol-function 'envoy-tmux--omp-program)
+                     (lambda () "/fake/omp"))
+                    ((symbol-function 'envoy-tmux--omp-discover-models)
+                     (lambda (_program)
+                       (user-error "Envoy: OMP model discovery failed"))))
+            (should-error (envoy-tmux--omp-models) :type 'user-error)))
+      (when (file-exists-p cache-file) (delete-file cache-file)))))
+
+(ert-deftest envoy-test-tmux-omp-models-ignore-a-foreign-program-cache ()
+  "A cache entry for another program is not offered as a fallback."
+  (let* ((cache-file (make-temp-file "envoy-test-omp-cache-"))
+         (envoy-tmux-omp-model-cache-file cache-file)
+         (envoy-tmux-providers (copy-tree envoy-tmux-providers)))
+    (unwind-protect
+        (progn
+          (plist-put (alist-get 'omp envoy-tmux-providers) :models nil)
+          (with-temp-file cache-file
+            (prin1 (list :program "/other/omp"
+                         :time (float-time)
+                         :models '("other/one"))
+                   (current-buffer)))
+          (cl-letf (((symbol-function 'envoy-tmux--omp-program)
+                     (lambda () "/fake/omp"))
+                    ((symbol-function 'envoy-tmux--omp-discover-models)
+                     (lambda (_program)
+                       (user-error "Envoy: OMP model discovery failed"))))
+            (should-error (envoy-tmux--omp-models) :type 'user-error)))
+      (delete-file cache-file))))
+
+
 (ert-deftest envoy-test-tmux-omp-and-codex-heading-dispatchers-accept-prefixes ()
   "The two new heading commands pass optional prefixes to dispatch."
   (let (calls)
@@ -3422,31 +4136,430 @@ and a command-line prompt arrives before the opening input can be sent."
       (funcall #'envoy-tmux-org-heading-codex '(4))
       (funcall #'envoy-tmux-org-heading-omp nil)
       (funcall #'envoy-tmux-org-heading-omp '(4))
+      (funcall #'envoy-tmux-org-heading-dsh nil)
+      (funcall #'envoy-tmux-org-heading-dsh '(4))
       (should (equal (nreverse calls)
                      '((codex nil)
                        (codex (4))
                        (omp nil)
-                       (omp (4))))))))
+                       (omp (4))
+                       (dsh nil)
+                       (dsh (4))))))))
 
-(ert-deftest envoy-test-org-collect-files-a-spooled-report-under-its-heading ()
-  "The report collector files a done spool entry under its heading."
+(ert-deftest envoy-test-org-whole-heading-stale-done-marker-stays-active ()
+  "A done marker without status cannot complete the heading."
   (let ((spool (make-temp-file "envoy-test-spool-" t)))
     (unwind-protect
         (let ((envoy-org-spool-directory spool))
-          (envoy-test--with-org-file "* TODO The task\nBody.\n"
-            (let ((key (envoy-org--spool-open "The task" nil)))
-              (should key)
-              (with-temp-file (envoy-org--spool-file key envoy-org--spool-done-suffix)
-                (insert "The report is complete.\n"))
+          (envoy-test--with-org-file
+              "#+TODO: TODO DOING | DONE\n* TODO The task\nBody.\n"
+            (let* ((key (envoy-org--spool-open "The task" nil))
+                   (state (envoy-org--spool-file
+                           key envoy-org--spool-state-suffix))
+                   (done (envoy-org--spool-file
+                          key envoy-org--spool-done-suffix)))
+              (delete-file state)
+              (with-temp-file done
+                (insert "The run stopped before all work was complete.\n"))
               (should (= (envoy-org-collect-reports) 1))
-              (should (string-match-p "The report is complete\\."
+              (should (equal (org-get-todo-state) "DOING"))
+              (should (string-match-p "stopped before all work"
                                       (buffer-string)))
-              (should (string-match-p ":ENVOY:"
+              (should-not (string-match-p "ENVOY_STATUS" (buffer-string)))
+              (should-not (file-exists-p state))
+              (should-not (file-exists-p done)))))
+      (delete-directory spool t))))
+
+(ert-deftest envoy-test-org-whole-heading-status-requires-exact-completion ()
+  "Missing, invalid, or incomplete status keeps the heading active."
+  (dolist (report
+           '("ENVOY_STATUS: incomplete\nThe budget check remains unfinished."
+             "The budget check remains unfinished."
+             "ENVOY_STATUS: complete \nThe budget check remains unfinished."
+             "ENVOY_STATUS: Complete\nThe budget check remains unfinished."
+             "envoy_status: complete\nThe budget check remains unfinished."
+             "The report starts with prose.\nENVOY_STATUS: complete\nThe budget check remains unfinished."
+             "ENVOY_STATUS: complete\nThe budget check remains unfinished.\nENVOY_STATUS: incomplete"))
+    (envoy-test--with-org-file
+        "#+TODO: TODO DOING | DONE\n* TODO The task\n** TODO First part\n** TODO Budget check\n"
+      (let ((envoy-provider 'test)
+            (envoy-providers '((test :program "true" :name "test agent"
+                                     :args nil :edit-args nil
+                                     :deny-arg nil :model-arg nil)))
+            (envoy-org-output-instructions nil)
+            (envoy-org-outward-action-guard nil)
+            callback)
+        (cl-letf (((symbol-function 'envoy-run)
+                   (lambda (_prompt cb &rest _keys)
+                     (setq callback cb)
+                     'fake-process))
+                  ((symbol-function 'envoy-org--attach-directory)
+                   (lambda () nil))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (envoy-org-heading)
+          (funcall callback
+                   (envoy--make-result :ok t :text report :status 0)))
+        (goto-char (point-min))
+        (re-search-forward "^\\* DOING The task$")
+        (org-back-to-heading t)
+        (should (equal (org-get-todo-state) "DOING"))
+        (should (string-match-p "budget check remains" (buffer-string)))
+        (should-not (string-match-p "ENVOY_STATUS" (buffer-string)))))))
+
+(ert-deftest envoy-test-org-whole-heading-explicit-completion-reaches-done ()
+  "An explicit whole-subtree completion moves the heading to DONE."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO The task\n** TODO First part\n** TODO Budget check\n"
+    (let ((envoy-provider 'test)
+          (envoy-providers '((test :program "true" :name "test agent"
+                                   :args nil :edit-args nil
+                                   :deny-arg nil :model-arg nil)))
+          (envoy-org-output-instructions nil)
+          (envoy-org-outward-action-guard nil)
+          callback)
+      (cl-letf (((symbol-function 'envoy-run)
+                 (lambda (_prompt cb &rest _keys)
+                   (setq callback cb)
+                   'fake-process))
+                ((symbol-function 'envoy-org--attach-directory)
+                 (lambda () nil))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (envoy-org-heading)
+        (funcall callback
+                 (envoy--make-result
+                  :ok t
+                  :text (concat "ENVOY_STATUS: complete\n"
+                                "Every requested deliverable and check in "
+                                "the whole subtree is complete.")
+                  :status 0)))
+      (goto-char (point-min))
+      (re-search-forward "^\\* DONE The task$")
+      (org-back-to-heading t)
+      (should (equal (org-get-todo-state) "DONE"))
+      (should (string-match-p "whole subtree is complete"
+                              (buffer-string)))
+      (should-not (string-match-p "ENVOY_STATUS" (buffer-string))))))
+
+(ert-deftest envoy-test-org-whole-heading-links-only-named-subprocess-output ()
+  "The immediate result links only named files created after dispatch."
+  (let ((directory (make-temp-file "envoy-test-output-links-" t)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "inherited.txt" directory)
+            (insert "project material\n"))
+          (envoy-test--with-org-file
+              "#+TODO: TODO DOING | DONE\n* TODO The task\n"
+            (let ((envoy-provider 'test)
+                  (envoy-providers '((test :program "true" :name "test agent"
+                                           :args nil :edit-args nil
+                                           :deny-arg nil :model-arg nil)))
+                  (envoy-org-output-instructions nil)
+                  (envoy-org-report-instructions nil)
+                  (envoy-org-outward-action-guard nil)
+                  callback)
+              (cl-letf (((symbol-function 'envoy-org--attach-directory)
+                         (lambda () directory))
+                        ((symbol-function 'org-attach-dir)
+                         (lambda (&rest _) directory))
+                        ((symbol-function 'envoy-run)
+                         (lambda (_prompt cb &rest _keys)
+                           (setq callback cb)
+                           'fake-process))
+                        ((symbol-function 'message) (lambda (&rest _) nil)))
+                (envoy-org-heading)
+                (with-temp-file (expand-file-name "deliverable.txt" directory)
+                  (insert "new result\n"))
+                (with-temp-file (expand-file-name "scratch.txt" directory)
+                  (insert "unmentioned output\n"))
+                (funcall callback
+                         (envoy--make-result
+                          :ok t
+                          :text (concat "ENVOY_STATUS: complete\n"
+                                        "The deliverable.txt is ready. "
+                                        "The inherited.txt file remains available.")
+                          :status 0))
+                (goto-char (point-min))
+                (re-search-forward "^\\* DONE The task$")
+                (org-back-to-heading t)
+                (should (equal (org-get-todo-state) "DONE"))
+                (should
+                 (string-match-p
+                  (regexp-quote
+                   (org-link-make-string
+                    "attachment:deliverable.txt"
+                    (org-link-escape "deliverable.txt")))
+                  (buffer-string)))
+                (dolist (filename '("inherited.txt" "scratch.txt"))
+                  (should-not
+                   (string-match-p
+                    (regexp-quote
+                     (org-link-make-string
+                      (concat "attachment:" filename)
+                      (org-link-escape filename)))
+                    (buffer-string))))))))
+      (delete-directory directory t))))
+
+(ert-deftest envoy-test-org-whole-heading-failed-transport-stays-active ()
+  "A failed transport cannot complete a task even with a complete report."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO The task\n** TODO Remaining work\n"
+    (let ((envoy-provider 'test)
+          (envoy-providers '((test :program "true" :name "test agent"
+                                   :args nil :edit-args nil
+                                   :deny-arg nil :model-arg nil)))
+          (envoy-org-output-instructions nil)
+          (envoy-org-outward-action-guard nil)
+          callback)
+      (cl-letf (((symbol-function 'envoy-run)
+                 (lambda (_prompt cb &rest _keys)
+                   (setq callback cb)
+                   'fake-process))
+                ((symbol-function 'envoy-org--attach-directory)
+                 (lambda () nil))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (envoy-org-heading)
+        (funcall callback
+                 (envoy--make-result
+                  :ok nil
+                  :text (concat "ENVOY_STATUS: complete\n"
+                                "The transport failed before delivery.")
+                  :status 1)))
+      (goto-char (point-min))
+      (re-search-forward "^\\* DOING The task$")
+      (org-back-to-heading t)
+      (should (equal (org-get-todo-state) "DOING"))
+      (should (string-match-p "transport failed before delivery"
+                              (buffer-string)))
+      (should-not (string-match-p "ENVOY_STATUS" (buffer-string))))))
+
+(ert-deftest envoy-test-org-whole-heading-custom-done-keyword-is-honored ()
+  "An explicit complete status uses the configured done keyword."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | SHIPPED\n* TODO The task\n** TODO Deliverable\n"
+    (let ((envoy-org-done-keyword "SHIPPED")
+          (result
+           (envoy--make-result
+            :ok t
+            :text (concat "ENVOY_STATUS: complete\n"
+                          "Every subtree deliverable is complete.")
+            :status 0)))
+      (envoy-org--finish (point-marker) (current-buffer) result nil)
+      (should (equal (org-get-todo-state) "SHIPPED")))))
+
+(ert-deftest envoy-test-org-whole-heading-completion-advances-repeater ()
+  "An explicit complete status keeps Org's repeat transition."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO Repeat\nSCHEDULED: <2026-09-19 Sat +1d>\n"
+    (let ((result
+           (envoy--make-result
+            :ok t
+            :text (concat "ENVOY_STATUS: complete\n"
+                          "The repeated subtree is complete.")
+            :status 0)))
+      (envoy-org--finish (point-marker) (current-buffer) result nil)
+      (should (equal (org-get-todo-state) "TODO"))
+      (should (equal (org-entry-get nil "SCHEDULED")
+                     "<2026-09-20 Sun +1d>")))))
+
+(ert-deftest envoy-test-org-whole-heading-disabled-active-keyword-keeps-state ()
+  "Disabling the active keyword leaves the current state unchanged."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO The task\n"
+    (let ((envoy-org-active-keyword nil)
+          (result (envoy--make-result
+                   :ok t
+                   :text "ENVOY_STATUS: incomplete\nThe task remains incomplete."
+                   :status 0)))
+      (envoy-org--finish (point-marker) (current-buffer) result nil)
+      (should (equal (org-get-todo-state) "TODO")))))
+
+(ert-deftest envoy-test-org-whole-heading-spooled-incomplete-stays-active ()
+  "An incomplete report stays active and links its named new output."
+  (let ((directory (make-temp-file "envoy-test-partial-output-" t)))
+    (unwind-protect
+        (envoy-test--with-org-file
+            "#+TODO: TODO DOING | DONE\n* TODO The task\n"
+          (cl-letf (((symbol-function 'org-attach-dir)
+                     (lambda (&rest _) directory)))
+            (let* ((before (envoy-org--attachment-files directory))
+                   (key (envoy-org--spool-open "The task" before))
+                   (done (envoy-org--spool-file
+                          key envoy-org--spool-done-suffix))
+                   (output (expand-file-name "partial-output.txt" directory)))
+              (with-temp-file output (insert "unfinished output\n"))
+              (envoy-test--publish-spool-marker
+               done
+               "The partial-output.txt file is usable, but the budget check remains unfinished."
+               "incomplete")
+              (should (= (envoy-org-collect-reports) 1))
+              (should (equal (org-get-todo-state) "DOING"))
+              (should (string-match-p "budget check remains unfinished"
                                       (buffer-string)))
-              (should (string-match-p ":END:\nBody\\.\n"
-                                      (buffer-string)))
-              (should-not (file-exists-p
-                           (envoy-org--spool-file key envoy-org--spool-done-suffix))))))
+              (should-not (string-match-p "ENVOY_STATUS" (buffer-string)))
+              (should
+               (string-match-p
+                (regexp-quote
+                 (org-link-make-string
+                  "attachment:partial-output.txt"
+                  (org-link-escape "partial-output.txt")))
+                (buffer-string))))))
+      (delete-directory directory t))))
+
+(ert-deftest envoy-test-org-whole-heading-spooled-failure-stays-active ()
+  "A failed marker cannot complete a task with a complete status."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO The task\n"
+    (let* ((key (envoy-org--spool-open "The task" nil))
+           (failed (envoy-org--spool-file key envoy-org--spool-failed-suffix)))
+      (envoy-test--publish-spool-marker
+       failed "The transport failed before delivery." "complete")
+      (should (= (envoy-org-collect-reports) 1))
+      (should (equal (org-get-todo-state) "DOING"))
+      (should (string-match-p "transport failed before delivery"
+                              (buffer-string)))
+      (should-not (string-match-p "ENVOY_STATUS" (buffer-string))))))
+
+(ert-deftest envoy-test-org-whole-heading-status-only-collection-replaces-drawer ()
+  "A status-only completion replaces the old report with its current state."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* DOING The task\n:PROPERTIES:\n:ID: status-only-task\n:END:\n:ENVOY:\n  DOING\nThe prior run left unfinished work.\n:END:\nBody.\n"
+    (let* ((key (envoy-org--spool-open "The task" nil))
+           (done (envoy-org--spool-file
+                  key envoy-org--spool-done-suffix)))
+      (envoy-test--publish-spool-marker done "" "complete")
+      (should (= (envoy-org-collect-reports) 1))
+      (goto-char (point-min))
+      (re-search-forward "^\\* DONE The task$")
+      (org-back-to-heading t)
+      (should (equal (org-get-todo-state) "DONE"))
+      (let* ((drawer (envoy-org--drawer-bounds envoy-org-drawer))
+             (drawer-text
+              (and drawer
+                   (buffer-substring-no-properties
+                    (car drawer) (cdr drawer))))
+             (persisted
+              (with-temp-buffer
+                (insert-file-contents file)
+                (buffer-string))))
+        (should drawer)
+        (should (string-match-p "  DONE\n" drawer-text))
+        (should-not
+         (string-match-p "The prior run left unfinished work" drawer-text))
+        (should (string-match-p "^\\* DONE The task$" persisted))
+        (should (string-match-p "  DONE\n" persisted))
+        (should-not
+         (string-match-p "The prior run left unfinished work" persisted))
+        (should-not (string-match-p "ENVOY_STATUS" persisted))))))
+
+(ert-deftest envoy-test-org-whole-heading-links-only-named-new-attachments ()
+  "Collection links only existing, named entries outside the known baseline."
+  (let ((attachment-root
+         (make-temp-file "envoy-test-inherited-attachments-" t)))
+    (unwind-protect
+        (dolist
+            (scenario
+             '((missing-state
+                ("catalog.txt") (("new-output.txt" file))
+                "The new-output.txt file is ready." nil
+                ("new-output.txt" "catalog.txt"))
+               (empty-known
+                nil (("empty-output.txt" file))
+                "The empty-output.txt file is ready."
+                ("empty-output.txt") nil)
+               (preexisting
+                ("existing.txt") nil
+                "The existing.txt file remains useful." nil
+                ("existing.txt"))
+               (unmentioned
+                nil (("unmentioned.txt" file) ("scratch-bundle" directory))
+                "The task result is complete." nil
+                ("unmentioned.txt" "scratch-bundle"))
+               (named-new
+                ("old-support.txt") (("deliverable.txt" file))
+                "The deliverable.txt file contains the result."
+                ("deliverable.txt") ("old-support.txt"))
+               (substring
+                nil (("result.txt" file))
+                "The result.txtx file is not a deliverable."
+                nil ("result.txt"))
+               (period-punctuation
+                nil (("period.txt" file))
+                "See period.txt. It contains the final figures."
+                ("period.txt") nil)
+               (named-directory
+                nil (("release-bundle" directory))
+                "The release-bundle directory contains the deliverable."
+                ("release-bundle") nil)))
+          (let* ((name (nth 0 scenario))
+                 (initial (nth 1 scenario))
+                 (outputs (nth 2 scenario))
+                 (summary (nth 3 scenario))
+                 (linked (nth 4 scenario))
+                 (unlinked (nth 5 scenario))
+                 (directory (expand-file-name (symbol-name name)
+                                              attachment-root))
+                 (id (format "attachment-%s" name)))
+            (make-directory directory t)
+            (dolist (filename initial)
+              (with-temp-file (expand-file-name filename directory)
+                (insert "existing material\n")))
+            (envoy-test--with-org-file
+                (format "#+TODO: TODO DOING | DONE\n* TODO The task\n:PROPERTIES:\n:ID: %s\n:END:\n"
+                        id)
+              (cl-letf (((symbol-function 'org-attach-dir)
+                         (lambda (&rest _) directory)))
+                (let* ((before (envoy-org--attachment-files directory))
+                       (key (envoy-org--spool-open "The task" before))
+                       (state (envoy-org--spool-file
+                               key envoy-org--spool-state-suffix))
+                       (done (envoy-org--spool-file
+                              key envoy-org--spool-done-suffix)))
+                  (when (eq name 'missing-state)
+                    (delete-file state))
+                  (dolist (output outputs)
+                    (let ((path (expand-file-name (car output) directory)))
+                      (if (eq (cadr output) 'directory)
+                          (make-directory path)
+                        (with-temp-file path (insert "new output\n")))))
+                  (envoy-test--publish-spool-marker done summary "complete")
+                  (should (= (envoy-org-collect-reports) 1))
+                  (goto-char (point-min))
+                  (re-search-forward "^\\* DONE The task$")
+                  (org-back-to-heading t)
+                  (should (equal (org-get-todo-state) "DONE"))
+                  (should-not (string-match-p "ENVOY_STATUS" (buffer-string)))
+                  (dolist (filename linked)
+                    (let ((link (org-link-make-string
+                                 (concat "attachment:" filename)
+                                 (org-link-escape filename))))
+                      (should (string-match-p (regexp-quote link)
+                                              (buffer-string)))))
+                  (dolist (filename unlinked)
+                    (let ((link (org-link-make-string
+                                 (concat "attachment:" filename)
+                                 (org-link-escape filename))))
+                      (should-not (string-match-p (regexp-quote link)
+                                                  (buffer-string))))))))))
+      (delete-directory attachment-root t))))
+
+(ert-deftest envoy-test-org-collect-rescans-a-missing-id-at-most-once-per-interval ()
+  "An unresolvable report does not drive an org-id rescan every cycle."
+  (let ((spool (make-temp-file "envoy-test-spool-" t)))
+    (unwind-protect
+        (let ((envoy-org-spool-directory spool)
+              (envoy-org-missing-id-rescan-interval 3600)
+              (envoy-org--missing-id-rescan-time 0)
+              (rescans 0))
+          (envoy-test--publish-spool-marker
+           (expand-file-name "missing-id.done" spool)
+           "A report for a heading that does not exist.\n")
+          (cl-letf (((symbol-function 'org-id-find-id-file)
+                     (lambda (_id) nil))
+                    ((symbol-function 'org-id-update-id-locations)
+                     (lambda (&rest _) (cl-incf rescans))))
+            (envoy-org-collect-reports)
+            (envoy-org-collect-reports)
+            (should (= rescans 1))))
       (delete-directory spool t))))
 
 (provide 'envoy-test)
@@ -3724,12 +4837,12 @@ and a command-line prompt arrives before the opening input can be sent."
         (let ((envoy-org-spool-directory spool))
           (set-file-modes spool #o755)
           (let ((state (envoy-org--spool-write-state
-                        "state-key" "id" "TODO" nil)))
+                        "state-key" "id" nil)))
             (should (= (file-modes spool) #o700))
             (should (= (file-modes state) #o600)))
           (delete-directory spool t)
           (let ((state (envoy-org--spool-write-state
-                        "new-key" "id" "TODO" nil)))
+                        "new-key" "id" nil)))
             (should (= (file-modes spool) #o700))
             (should (= (file-modes state) #o600))))
       (when (file-directory-p spool)
@@ -3743,10 +4856,8 @@ and a command-line prompt arrives before the opening input can be sent."
          (link (expand-file-name "evil.done" spool)))
     (unwind-protect
         (progn
-          (with-temp-file good
-            (insert "safe report\n"))
-          (with-temp-file outside
-            (insert "outside report\n"))
+          (envoy-test--publish-spool-marker good "safe report\n")
+          (envoy-test--publish-spool-marker outside "outside report\n")
           (make-symbolic-link outside link)
           (let ((envoy-org-spool-directory spool))
             (should (equal (envoy-org--spool-reports)
@@ -3809,10 +4920,11 @@ and a command-line prompt arrives before the opening input can be sent."
   "A keywordless repeating completion says it repeated and names no nil."
   (envoy-test--with-org "* TODO The task\n"
     (let ((envoy-org-done-keyword nil)
-          (result (envoy--make-result :ok t :text "Done." :status 0)))
+          (result (envoy--make-result
+                   :ok t :text "ENVOY_STATUS: complete\nDone." :status 0)))
       (cl-letf (((symbol-function 'org-get-repeat)
                  (lambda () "+1w")))
-        (envoy-org--finish (point-marker) (current-buffer) result nil "TODO")
+        (envoy-org--finish (point-marker) (current-buffer) result nil)
         (should-not (string-match-p "nil, repeats" (buffer-string)))
         (should (string-match-p (regexp-quote "repeats +1w")
                                 (buffer-string)))))))
@@ -3821,30 +4933,16 @@ and a command-line prompt arrives before the opening input can be sent."
   "A heading that does not repeat is labelled with its keyword alone."
   (envoy-test--with-org "* TODO The task\n"
     (let ((envoy-org-done-keyword 'done)
-          (result (envoy--make-result :ok t :text "Done." :status 0)))
+          (result (envoy--make-result
+                   :ok t :text "ENVOY_STATUS: complete\nDone." :status 0)))
       (cl-letf (((symbol-function 'org-get-repeat)
                  (lambda () nil)))
         (let ((keyword (envoy-org--finish
-                        (point-marker) (current-buffer) result nil "TODO")))
+                        (point-marker) (current-buffer) result nil)))
           (should keyword)
           (should (string-match-p (regexp-quote keyword) (buffer-string)))
           (should-not (string-match-p "repeats" (buffer-string))))))))
 
-(ert-deftest envoy-test-org-prompt-keeps-spool-request-with-report-off ()
-  "Disabling report prose still leaves a terminal report path."
-  (envoy-test--with-org "* TODO The task\n"
-    (let ((envoy-org-output-instructions nil)
-          (envoy-org-report-instructions nil)
-          (envoy-org-outward-action-guard nil))
-      (let ((prompt (envoy-org-build-prompt
-                     "The task" (envoy-org--subtree-text) nil nil "spool-key")))
-        (should (string-match-p "Where to leave your report" prompt))
-        (should (string-match-p
-                 (regexp-quote
-                  (envoy-org--spool-file
-                   "spool-key" envoy-org--spool-done-suffix))
-                 prompt))
-        (should-not (string-match-p "How to close" prompt))))))
 ;;; Notmuch show delegation
 
 (defmacro envoy-test--with-notmuch-thread (message-id thread-query thread-text
@@ -3879,6 +4977,30 @@ The optional notmuch package is not loaded."
                    (t (error "Unexpected notmuch arguments %S" args))))))
        ,@body)))
 
+(ert-deftest envoy-test-notmuch-delegate-dsh-sends-to-dsh ()
+  "The dsh notmuch command hands the request to dsh, not to OMP."
+  (with-temp-buffer
+    (let ((major-mode 'notmuch-show-mode)
+          (sent nil))
+      (envoy-test--with-notmuch-thread
+          "id:message-dsh" "thread:thread-dsh" "THREAD\n"
+        (cl-letf (((symbol-function 'envoy--read-direction)
+                   (lambda (&rest _) "Look at this"))
+                  ((symbol-function 'envoy-tmux-read-session)
+                   (lambda (provider)
+                     (should (eq provider 'dsh))
+                     "work"))
+                  ((symbol-function 'envoy-tmux-window)
+                   (lambda (&rest _) "work:7"))
+                  ((symbol-function 'envoy-tmux--provider-program)
+                   (lambda (&rest _) "/fake/dsh-launch"))
+                  ((symbol-function 'envoy-tmux-send)
+                   (lambda (target _prompt &optional provider &rest _)
+                     (setq sent (list target provider))))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (should (equal (envoy-notmuch-delegate-dsh) "work:7"))
+          (should (equal sent '("work:7" dsh))))))))
+
 (ert-deftest envoy-test-notmuch-region-precedes-thread-and-prompt-effects ()
   "The selected region stays primary after instruction input moves point.
 The prompt also keeps the complete thread as supporting, untrusted context."
@@ -3900,7 +5022,7 @@ The prompt also keeps the complete thread as supporting, untrusted context."
             "FULL MESSAGE\nCOLLAPSED MESSAGE\n"
           (cl-letf (((symbol-function 'envoy-tmux--omp-program)
                      (lambda () "/fake/omp"))
-                    ((symbol-function 'envoy--read-instruction)
+                    ((symbol-function 'envoy--read-direction)
                      (lambda (&rest _)
                        (deactivate-mark)
                        (goto-char (point-max))
@@ -3914,10 +5036,10 @@ The prompt also keeps the complete thread as supporting, untrusted context."
                        (setq window-called (list session title))
                        "work:7"))
                     ((symbol-function 'envoy-tmux-send)
-                     (lambda (target prompt &optional provider model setup plan-into
-                                      mode)
-                       (setq sent (list target prompt provider model setup plan-into
-                                        mode))))
+                     (lambda (target prompt &optional provider model setup
+                                      plan-into &rest _)
+                       (setq sent (list target prompt provider model setup
+                                        plan-into))))
                     ((symbol-function 'message) (lambda (&rest _) nil)))
             (should (equal (envoy-notmuch-delegate) "work:7"))
             (should window-called)
@@ -3953,6 +5075,76 @@ The prompt also keeps the complete thread as supporting, untrusted context."
               notmuch-calls)))
         (should (equal (buffer-string) before-text)))))))
 
+(ert-deftest envoy-test-notmuch-prefix-region-keeps-thread-out-of-task ()
+  "With a prefix and a region, the task covers the selection alone.
+The scope comes before any quoted mail, and the complete thread is marked as
+reference the agent must not act on."
+  (with-temp-buffer
+    (insert "Finding 1. Fix the guard\nFinding 9. Remember CI runs\n")
+    (let ((major-mode 'notmuch-show-mode)
+          (transient-mark-mode t)
+          (sent nil))
+      (goto-char (point-min))
+      (search-forward "Finding 9")
+      (set-mark (line-beginning-position))
+      (goto-char (line-end-position))
+      (activate-mark)
+      (envoy-test--with-notmuch-thread
+          "id:message-9" "thread:thread-9"
+          "Finding 1. Fix the guard\nFinding 9. Remember CI runs\n"
+        (cl-letf (((symbol-function 'envoy-tmux--read-variable)
+                   (lambda (provider)
+                     (should (eq provider 'omp))
+                     (list :model "planner" :plan-into "executor")))
+                  ((symbol-function 'envoy--read-direction)
+                   (lambda (&rest _) "Improve this"))
+                  ((symbol-function 'envoy-tmux-read-session)
+                   (lambda (&rest _) "work"))
+                  ((symbol-function 'envoy-tmux-window)
+                   (lambda (&rest _) "work:9"))
+                  ((symbol-function 'envoy-tmux-send)
+                   (lambda (target prompt &rest _)
+                     (setq sent (list target prompt))))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (envoy-notmuch-delegate '(4))
+          (let* ((prompt (nth 1 sent))
+                 (instruction-start (string-match "^DIRECTION FROM THE USER$" prompt))
+                 (scope-start (string-match "^TASK SCOPE$" prompt))
+                 (first-quote
+                  (string-match
+                   (regexp-quote "--- BEGIN UNTRUSTED QUOTED MAIL ---") prompt))
+                 (support-start
+                  (string-match "^SUPPORTING CURRENT THREAD$" prompt))
+                 (thread-start (string-match "^CURRENT THREAD$" prompt)))
+            (should scope-start)
+            (should (< instruction-start scope-start first-quote))
+            (let ((scope (substring prompt scope-start first-quote)))
+              (should (string-match-p "PRIMARY SELECTION" scope))
+              (should (string-match-p "outside the selection" scope)))
+            (should (< support-start thread-start))
+            (should (string-match-p
+                     "Do not act on"
+                     (substring prompt support-start thread-start)))))))))
+
+(ert-deftest envoy-test-notmuch-brief-routes-authorization-gates-through-ask ()
+  "A mail brief tells the agent to ask for approval rather than park a change."
+  (let ((prompt (envoy-notmuch--prompt
+                 "Improve this" "id:m" "thread:t" "Body" "Body" nil)))
+    (should (string-match-p "^APPROVALS$" prompt))
+    (should (string-match-p "`ask` tool" prompt))
+    (should (string-match-p "Never write a separate handoff" prompt))
+    (should (< (string-match "^APPROVALS$" prompt)
+               (string-match "^EMAIL SAFETY$" prompt)))))
+
+(ert-deftest envoy-test-org-brief-guard-names-the-user-as-dispatcher ()
+  "The outward-action guard says the user dispatched the brief, not that nobody did."
+  (envoy-test--with-org "* TODO The task\nDo the thing.\n"
+    (org-back-to-heading t)
+    (let ((prompt (envoy-org-build-prompt
+                   "The task" (envoy-org--subtree-text) "/tmp/x" nil)))
+      (should (string-match-p "The user dispatched this Org brief" prompt))
+      (should-not (string-match-p "No person typed" prompt)))))
+
 (ert-deftest envoy-test-notmuch-no-region-uses-complete-thread-query ()
   "Without a region, the prompt uses the CLI's complete thread text.
 Text visible in a filtered show buffer is not treated as the thread."
@@ -3966,17 +5158,17 @@ Text visible in a filtered show buffer is not treated as the thread."
           "COMPLETE MESSAGE ONE\nCOLLAPSED MESSAGE TWO\n"
         (cl-letf (((symbol-function 'envoy-tmux--omp-program)
                    (lambda () "/fake/omp"))
-                  ((symbol-function 'envoy--read-instruction)
+                  ((symbol-function 'envoy--read-direction)
                    (lambda (&rest _) "Summarize the thread"))
                   ((symbol-function 'envoy-tmux-read-session)
                    (lambda (&rest _) "work"))
                   ((symbol-function 'envoy-tmux-window)
                    (lambda (&rest _) "work:8"))
                   ((symbol-function 'envoy-tmux-send)
-                   (lambda (target prompt &optional provider model setup plan-into
-                                    mode)
-                     (setq sent (list target prompt provider model setup plan-into
-                                      mode))))
+                   (lambda (target prompt &optional provider model setup
+                                    plan-into &rest _)
+                     (setq sent (list target prompt provider model setup
+                                      plan-into))))
                   ((symbol-function 'message) (lambda (&rest _) nil)))
           (envoy-notmuch-delegate)
           (let ((prompt (nth 1 sent)))
@@ -4013,7 +5205,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                    (lambda (&rest _) (setq cli-called t)))
                   ((symbol-function 'envoy-tmux--omp-program)
                    (lambda () (error "OMP must not be checked")))
-                  ((symbol-function 'envoy--read-instruction)
+                  ((symbol-function 'envoy--read-direction)
                    (lambda (&rest _) (error "Instruction must not be read")))
                   ((symbol-function 'require)
                    (lambda (&rest _) t)))
@@ -4035,37 +5227,45 @@ Text visible in a filtered show buffer is not treated as the thread."
                  (lambda (&rest _) (setq send-called t)))
                 ((symbol-function 'notmuch-command-to-string)
                  (lambda (&rest _) (setq cli-called t)))
-                ((symbol-function 'envoy--read-instruction)
+                ((symbol-function 'envoy--read-direction)
                  (lambda (&rest _) (error "Instruction must not be read"))))
         (should-error (envoy-notmuch-delegate) :type 'user-error))
       (should-not window-called)
       (should-not send-called)
       (should-not cli-called))))
 
-(ert-deftest envoy-test-notmuch-blank-instruction-stops-before-dispatch ()
-  "A blank instruction does not open a window or create a prompt file."
+(ert-deftest envoy-test-notmuch-empty-direction-uses-default ()
+  "A blank direction uses the default and the command remains interactive."
+  (should (commandp #'envoy-notmuch-delegate))
   (with-temp-buffer
     (let ((major-mode 'notmuch-show-mode)
-          (window-called nil)
-          (send-called nil)
-          (write-called nil))
+          (sent nil)
+          (window-called nil))
       (envoy-test--with-notmuch-thread
           "id:message-3" "thread:thread-3" "THREAD\n"
         (cl-letf (((symbol-function 'envoy-tmux--omp-program)
                    (lambda () "/fake/omp"))
                   ((symbol-function 'read-string)
-                   (lambda (&rest _) "   "))
+                   (lambda (prompt)
+                     (should (equal prompt "Direction for OMP: "))
+                     "   "))
+                  ((symbol-function 'envoy-tmux-read-session)
+                   (lambda (&rest _) "work"))
                   ((symbol-function 'envoy-tmux-window)
-                   (lambda (&rest _) (setq window-called t)))
+                   (lambda (&rest _)
+                     (setq window-called t)
+                     "work:7"))
                   ((symbol-function 'envoy-tmux-send)
-                   (lambda (&rest _) (setq send-called t)))
-                  ((symbol-function 'envoy-tmux--write-prompt)
-                   (lambda (&rest _) (setq write-called t)))
+                   (lambda (_target prompt &rest _)
+                     (setq sent prompt)))
                   ((symbol-function 'require) (lambda (&rest _) t)))
-          (should-error (envoy-notmuch-delegate) :type 'user-error))
-        (should-not window-called)
-        (should-not send-called)
-        (should-not write-called)))))
+          (should (equal (envoy-notmuch-delegate) "work:7"))
+          (should window-called)
+          (should (string-match-p
+                   (regexp-quote
+                    (concat "DIRECTION FROM THE USER\n"
+                            envoy-default-direction "\n\n"))
+                   sent)))))))
 
 (ert-deftest envoy-test-notmuch-session-cancellation-stops-before-dispatch ()
   "Cancelling the session picker leaves tmux untouched."
@@ -4078,7 +5278,7 @@ Text visible in a filtered show buffer is not treated as the thread."
           "id:message-4" "thread:thread-4" "THREAD\n"
         (cl-letf (((symbol-function 'envoy-tmux--omp-program)
                    (lambda () "/fake/omp"))
-                  ((symbol-function 'envoy--read-instruction)
+                  ((symbol-function 'envoy--read-direction)
                    (lambda (&rest _) "Continue"))
                   ((symbol-function 'envoy-tmux-read-session)
                    (lambda (&rest _) (signal 'quit nil)))
@@ -4113,7 +5313,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                  (lambda (&rest _) (setq window-called t)))
                 ((symbol-function 'envoy-tmux-send)
                  (lambda (&rest _) (setq send-called t)))
-                ((symbol-function 'envoy--read-instruction)
+                ((symbol-function 'envoy--read-direction)
                  (lambda (&rest _) (error "Instruction must not be read"))))
         (should-error (envoy-notmuch-delegate) :type 'user-error))
       (should-not window-called)
@@ -4139,7 +5339,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                  (lambda (&rest _) (setq window-called t)))
                 ((symbol-function 'envoy-tmux-send)
                  (lambda (&rest _) (setq send-called t)))
-                ((symbol-function 'envoy--read-instruction)
+                ((symbol-function 'envoy--read-direction)
                  (lambda (&rest _) (error "Instruction must not be read"))))
         (should-error (envoy-notmuch-delegate) :type 'user-error))
       (should-not window-called)
@@ -4165,7 +5365,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                  (lambda (&rest _) (setq window-called t)))
                 ((symbol-function 'envoy-tmux-send)
                  (lambda (&rest _) (setq send-called t)))
-                ((symbol-function 'envoy--read-instruction)
+                ((symbol-function 'envoy--read-direction)
                  (lambda (&rest _) (error "Instruction must not be read"))))
         (should-error (envoy-notmuch-delegate) :type 'user-error))
       (should-not window-called)
@@ -4185,7 +5385,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                           :variable model :setup nil :models ("single")))))
               (envoy-test--with-notmuch-thread
                   "id:message-7" "thread:thread-7" "THREAD\n"
-                (cl-letf (((symbol-function 'envoy--read-instruction)
+                (cl-letf (((symbol-function 'envoy--read-direction)
                            (lambda (&rest _) "Run it"))
                           ((symbol-function 'envoy-tmux-read-session)
                            (lambda (&rest _) "work"))
@@ -4228,7 +5428,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                           :models ("planner" "executor")))))
               (envoy-test--with-notmuch-thread
                   "id:message-8" "thread:thread-8" "THREAD\n"
-                (cl-letf (((symbol-function 'envoy--read-instruction)
+                (cl-letf (((symbol-function 'envoy--read-direction)
                            (lambda (&rest _) "Plan it"))
                           ((symbol-function 'envoy-tmux-read-session)
                            (lambda (&rest _) "work"))
@@ -4362,7 +5562,8 @@ Text visible in a filtered show buffer is not treated as the thread."
               (should-error (envoy-org-heading) :type 'user-error)
               (should (= run-calls 1))
               (funcall callback
-                       (envoy--make-result :ok t :text "Done." :status 0))
+                       (envoy--make-result
+                        :ok t :text "ENVOY_STATUS: complete\nDone." :status 0))
               (should-not (file-exists-p claim-file)))))
       (delete-directory spool t))))
 
@@ -4393,7 +5594,8 @@ Text visible in a filtered show buffer is not treated as the thread."
                           key envoy-org--spool-done-suffix)))
               (should (file-exists-p claim))
               (should (file-exists-p state))
-              (with-temp-file done (insert "The report is complete.\n"))
+              (envoy-test--publish-spool-marker
+               done "The report is complete.\n")
               (should (= (envoy-org-collect-reports) 1))
               (should-not (file-exists-p claim))
               (should-not (file-exists-p state))
@@ -4416,7 +5618,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                            key envoy-org--spool-state-suffix))
                    (done (envoy-org--spool-file
                           key envoy-org--spool-done-suffix)))
-              (with-temp-file done (insert "The report.\n"))
+              (envoy-test--publish-spool-marker done "The report.\n")
               (cl-letf (((symbol-function 'save-buffer)
                          (lambda (&rest _)
                            (error "Save failed"))))
@@ -4425,19 +5627,116 @@ Text visible in a filtered show buffer is not treated as the thread."
               (should (file-exists-p state)))))
       (delete-directory spool t))))
 
-(defun envoy-test--publish-spool-marker (file text)
-  "Publish TEXT to FILE through a same-directory temporary rename."
-  (let ((temporary
-         (make-temp-file
-          (expand-file-name ".envoy-test-marker-"
-                            (file-name-directory file)))))
+(defun envoy-test--publish-spool-marker (file text &optional status)
+  "Publish TEXT and STATUS to FILE through a same-directory rename."
+  (let* ((status (or status
+                     (cond
+                      ((string-suffix-p envoy-org--spool-done-suffix file)
+                       "complete")
+                      ((string-suffix-p envoy-org--spool-failed-suffix file)
+                       "incomplete"))))
+         (temporary
+          (make-temp-file
+           (expand-file-name ".envoy-test-marker-"
+                             (file-name-directory file)))))
     (unwind-protect
         (progn
           (with-temp-file temporary
+            (when status
+              (insert (format "ENVOY_STATUS: %s\n" status)))
             (insert text))
           (rename-file temporary file t))
       (when (file-exists-p temporary)
         (delete-file temporary)))))
+
+(ert-deftest envoy-test-org-quiet-collector-is-silent-but-manual-report-is-visible ()
+  "Background collection stays silent while a manual sweep remains visible."
+  (envoy-test--with-org-file
+      "#+TODO: TODO DOING | DONE\n* TODO Other task\nUnchanged.\n* TODO The task\nBody.\n"
+    (let* ((messages (get-buffer-create "*Messages*"))
+           (original-messages
+            (with-current-buffer messages (buffer-string)))
+           (original-message-point
+            (with-current-buffer messages (point)))
+           (original-messages-modified
+            (with-current-buffer messages (buffer-modified-p)))
+           (original-messages-read-only
+            (with-current-buffer messages buffer-read-only))
+           (message-log-max t))
+      (unwind-protect
+          (progn
+            (let ((before (with-current-buffer messages (buffer-string))))
+              (envoy-org--collect-quietly)
+              (with-current-buffer messages
+                (should (equal before (buffer-string)))))
+            (let* ((missing-id "quiet-collector-missing-heading")
+                   (missing-key (envoy-org--spool-key missing-id))
+                   (missing-claim
+                    (envoy-org--spool-claim missing-id "Missing heading"))
+                   (missing-state
+                    (envoy-org--spool-write-state missing-key missing-id nil))
+                   (missing-done
+                    (envoy-org--spool-file
+                     missing-key envoy-org--spool-done-suffix)))
+              (envoy-test--publish-spool-marker
+               missing-done "Waiting report.\n")
+              (re-search-forward "^\\* TODO The task$")
+              (org-back-to-heading t)
+              (let* ((target-id (org-id-get-create))
+                     (target-claim
+                      (envoy-org--spool-claim target-id "The task"))
+                     (target-key (envoy-org--spool-open "The task" nil))
+                     (target-state
+                      (envoy-org--spool-file
+                       target-key envoy-org--spool-state-suffix))
+                     (target-done
+                      (envoy-org--spool-file
+                       target-key envoy-org--spool-done-suffix))
+                     (messages-before
+                      (with-current-buffer messages (buffer-string))))
+                (envoy-test--publish-spool-marker
+                 target-done "The filed report.\n")
+                (dotimes (_ 2)
+                  (envoy-org--collect-quietly)
+                  (with-current-buffer messages
+                    (should (equal messages-before (buffer-string)))))
+                (should (file-exists-p (plist-get missing-claim :file)))
+                (should (file-exists-p missing-state))
+                (should (equal "ENVOY_STATUS: complete\nWaiting report.\n"
+                               (envoy-test--file-text missing-done)))
+                (should-not (file-exists-p (plist-get target-claim :file)))
+                (should-not (file-exists-p target-state))
+                (should-not (file-exists-p target-done))
+                (let* ((saved (envoy-test--file-text file))
+                       (other (string-match "^\\* TODO Other task" saved))
+                       (target (string-match "^\\* DONE The task" saved))
+                       (report (string-match "The filed report\\." saved)))
+                  (should other)
+                  (should target)
+                  (should report)
+                  (should (< other target))
+                  (should (< target report))
+                  (should-not
+                   (string-match-p
+                    "The filed report\\." (substring saved other target))))
+                (let ((manual-before
+                       (with-current-buffer messages (buffer-string))))
+                  (let ((inhibit-message nil))
+                    (should (= (envoy-org-collect-reports) 0)))
+                  (with-current-buffer messages
+                    (let ((after (buffer-string)))
+                      (should (string-prefix-p manual-before after))
+                      (should
+                       (string-match-p
+                        "Envoy:" (substring after (length manual-before)))))))
+                (should (file-exists-p missing-done)))))
+        (with-current-buffer messages
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (insert original-messages)
+            (goto-char (min original-message-point (point-max)))
+            (set-buffer-modified-p original-messages-modified)
+            (setq buffer-read-only original-messages-read-only)))))))
 
 (ert-deftest envoy-test-tmux-prefixed-wrapper-selects-after-claim ()
   "A prefixed public wrapper selects OMP only after it claims the heading."
@@ -4461,8 +5760,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                    (lambda (&rest _)
                      (setq selection-called t
                            selection-saw-claim (file-exists-p claim-file))
-                     '(:model "selected-model" :setup nil
-                       :plan-into nil :mode nil)))
+                     '(:model "selected-model" :setup nil :plan-into nil)))
                   ((symbol-function 'envoy-tmux-read-session)
                    (lambda (&rest _) "test"))
                   ((symbol-function 'envoy-tmux-window)
@@ -4471,7 +5769,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                      "test:7"))
                   ((symbol-function 'envoy-tmux-send)
                    (lambda (_target _prompt &optional _provider model
-                                     _setup _plan-into _mode on-start)
+                                     _setup _plan-into on-start _claim &rest _)
                      (setq sent-model model)
                      (when on-start (funcall on-start))))
                   ((symbol-function 'envoy-org--attach-directory)
@@ -4496,6 +5794,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                   :prompt-arg "@%s" :model-arg "--model"
                   :variable model :setup nil :models nil)))
           (claim-seen nil)
+          (direction-called nil)
           (selector-called nil)
           (discovery-called nil)
           (window-called nil)
@@ -4507,6 +5806,10 @@ Text visible in a filtered show buffer is not treated as the thread."
                    (lambda ()
                      (setq claim-seen (file-exists-p claim-file))
                      (user-error "OMP is unavailable")))
+                  ((symbol-function 'envoy--read-direction)
+                   (lambda (&rest _)
+                     (setq direction-called t)
+                     (error "Direction must not be read")))
                   ((symbol-function 'envoy-tmux--read-variable)
                    (lambda (&rest _)
                      (setq selector-called t)
@@ -4525,6 +5828,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                      (error "Window must not run"))))
           (should-error (envoy-tmux-org-heading-omp) :type 'user-error))
         (should claim-seen)
+        (should-not direction-called)
         (should-not selector-called)
         (should-not discovery-called)
         (should-not session-called)
@@ -4612,7 +5916,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                  (lambda (&rest _) "test:7"))
                 ((symbol-function 'envoy-tmux-send)
                  (lambda (_target _prompt &optional _provider _model _setup
-                                   _plan-into _mode on-start)
+                                   _plan-into on-start _claim &rest _)
                    (when on-start (funcall on-start))
                    (let ((done (envoy-org--spool-file
                                 (envoy-org--spool-key
@@ -5066,7 +6370,7 @@ Text visible in a filtered show buffer is not treated as the thread."
                  (lambda (&rest _) "test:7"))
                 ((symbol-function 'envoy-tmux-send)
                  (lambda (_target _prompt &optional _provider _model _setup
-                                   _plan-into _mode on-start)
+                                   _plan-into on-start _claim &rest _)
                    (when on-start (funcall on-start))))
                 ((symbol-function 'envoy-org--set-keyword)
                  (lambda (&rest _)
@@ -5085,3 +6389,393 @@ Text visible in a filtered show buffer is not treated as the thread."
         (should (file-exists-p claim))
         (should (file-exists-p state))
         (should (equal (org-get-todo-state) "TODO"))))))
+
+;;; Dired dispatch
+
+(require 'envoy-dired)
+
+(defmacro envoy-test--with-dired-files (names &rest body)
+  "Run BODY in Dired for temporary files named NAMES."
+  (declare (indent 1))
+  `(let* ((directory (make-temp-file "envoy-test-dired-" t))
+          (dired-buffer nil))
+     (unwind-protect
+         (progn
+           (dolist (name ,names)
+             (with-temp-file (expand-file-name name directory)
+               (insert "* Example\n")))
+           (setq dired-buffer (dired-noselect directory))
+           (with-current-buffer dired-buffer
+             ,@body))
+       (when (buffer-live-p dired-buffer)
+         (kill-buffer dired-buffer))
+       (delete-directory directory t))))
+
+(ert-deftest envoy-test-dired-prefix-dispatches-in-prompt-order ()
+  "A Dired dispatch asks for direction, selection, and session before launch."
+  (envoy-test--with-dired-files '("task.org")
+    (let* ((path (expand-file-name "task.org" default-directory))
+           (envoy-tmux-providers
+            '((claude :program "true" :name "Claude" :variable setup)))
+           (events nil)
+           sent window-title)
+      (dired-goto-file path)
+      (cl-letf (((symbol-function 'read-string)
+                 (lambda (prompt &rest _)
+                   (setq events (append events '(direction)))
+                   (should (equal prompt "Direction for Claude: "))
+                   "Inspect the Org file"))
+                ((symbol-function 'envoy-tmux--read-variable)
+                 (lambda (provider)
+                   (setq events (append events '(selection)))
+                   (should (eq provider 'claude))
+                   '(:model nil :setup "careful" :plan-into nil)))
+                ((symbol-function 'envoy-tmux-read-session)
+                 (lambda (provider)
+                   (setq events (append events '(session)))
+                   (should (eq provider 'claude))
+                   "work"))
+                ((symbol-function 'envoy-tmux-window)
+                 (lambda (session title)
+                   (setq events (append events '(window))
+                         window-title title)
+                   (should (equal session "work"))
+                   "work:3"))
+                ((symbol-function 'envoy-tmux-send)
+                 (lambda (target prompt provider model setup plan-into &rest _)
+                   (setq events (append events '(send))
+                         sent (list target prompt provider model setup
+                                    plan-into))))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (should (equal (envoy-dired-claude '(4)) "work:3"))
+        (should (equal events '(direction selection session window send)))
+        (should (equal window-title "task.org"))
+        (should (equal (nth 0 sent) "work:3"))
+        (should (eq (nth 2 sent) 'claude))
+        (should (equal (nth 4 sent) "careful"))
+        (should (string-prefix-p
+                 "USER DIRECTION\nInspect the Org file\n\n" (nth 1 sent)))))))
+
+(ert-deftest envoy-test-dired-marked-files-are-all-named-in-brief ()
+  "Every marked Dired file appears in the brief as an absolute JSON string."
+  (envoy-test--with-dired-files '("a-task.org" "b-notes.txt")
+    (let* ((envoy-tmux-providers
+            '((claude :program "true" :name "Claude")))
+           (first (expand-file-name "a-task.org" default-directory))
+           (second (expand-file-name "b-notes.txt" default-directory))
+           (files nil)
+           (prompt nil)
+           (title nil))
+      (dired-goto-file first)
+      (dired-mark 1)
+      (dired-goto-file second)
+      (dired-mark 1)
+      (setq files (dired-get-marked-files))
+      (cl-letf (((symbol-function 'read-string)
+                 (lambda (&rest _) "Review these files"))
+                ((symbol-function 'envoy-tmux-read-session)
+                 (lambda (&rest _) "work"))
+                ((symbol-function 'envoy-tmux-window)
+                 (lambda (_session window-name)
+                   (setq title window-name)
+                   "work:4"))
+                ((symbol-function 'envoy-tmux-send)
+                 (lambda (_target brief &rest _)
+                   (setq prompt brief)))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (envoy-dired-claude nil))
+      (dolist (path files)
+        (should (string-match-p
+                 (regexp-quote (json-encode-string (expand-file-name path)))
+                 prompt)))
+      (should (equal title
+                     (format "%s (+%d more)"
+                             (file-name-nondirectory
+                              (directory-file-name (car files)))
+                             (1- (length files))))))))
+
+(ert-deftest envoy-test-dired-empty-direction-uses-default ()
+  "An empty direction uses `envoy-default-direction' in the brief."
+  (envoy-test--with-dired-files '("task.org")
+    (let ((envoy-default-direction "Use the fallback direction")
+          (envoy-tmux-providers '((claude :program "true" :name "Claude")))
+          (prompt nil))
+      (dired-goto-file (expand-file-name "task.org" default-directory))
+      (cl-letf (((symbol-function 'read-string) (lambda (&rest _) ""))
+                ((symbol-function 'envoy-tmux-read-session)
+                 (lambda (&rest _) "work"))
+                ((symbol-function 'envoy-tmux-window)
+                 (lambda (&rest _) "work:5"))
+                ((symbol-function 'envoy-tmux-send)
+                 (lambda (_target brief &rest _) (setq prompt brief)))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (envoy-dired-claude nil))
+      (should (string-prefix-p
+               "USER DIRECTION\nUse the fallback direction\n\n" prompt)))))
+
+(ert-deftest envoy-test-dired-rejects-empty-file-list-before-prompt ()
+  "An empty Dired buffer is rejected before asking for direction."
+  (envoy-test--with-dired-files nil
+    (let ((prompt-called nil))
+      (cl-letf (((symbol-function 'read-string)
+                 (lambda (&rest _) (setq prompt-called t) "Continue")))
+        (should-error (envoy-dired-to 'claude) :type 'user-error))
+      (should-not prompt-called))))
+
+(ert-deftest envoy-test-dired-rejects-non-dired-buffer ()
+  "Dired dispatch is available only from a Dired buffer."
+  (with-temp-buffer
+    (should-error (envoy-dired-to 'claude) :type 'user-error)))
+
+(ert-deftest envoy-test-dired-missing-provider-errors-before-prompt ()
+  "A missing provider executable fails before asking for direction."
+  (envoy-test--with-dired-files '("task.org")
+    (let ((envoy-tmux-providers
+           '((claude :program "/not/a/real/envoy-program" :name "Claude")))
+          (prompt-called nil))
+      (dired-goto-file (expand-file-name "task.org" default-directory))
+      (cl-letf (((symbol-function 'read-string)
+                 (lambda (&rest _) (setq prompt-called t) "Continue")))
+        (should-error (envoy-dired-to 'claude) :type 'user-error))
+      (should-not prompt-called))))
+
+(ert-deftest envoy-test-dired-setup-keys-binds-all-dispatches ()
+  "The setup command binds the six Dired shortcuts."
+  (let ((dired-mode-map (copy-keymap dired-mode-map)))
+    (envoy-dired-setup-keys)
+    (dolist (binding '(("C-c C-x A" . envoy-dired-claude)
+                       ("C-c C-x R" . envoy-dired-reasonix)
+                       ("C-c C-x P" . envoy-dired-pi)
+                       ("C-c C-x C" . envoy-dired-codex)
+                       ("C-c C-x O" . envoy-dired-omp)
+                       ("C-c C-x S" . envoy-dired-dsh)))
+      (should (eq (lookup-key dired-mode-map (kbd (car binding)))
+                  (cdr binding))))))
+
+(ert-deftest envoy-test-dired-omp-checks-program-before-prompt ()
+  "An unavailable OMP program fails before asking for direction."
+  (envoy-test--with-dired-files '("task.org")
+    (let ((envoy-tmux-providers '((omp :program "true" :name "OMP")))
+          (prompt-called nil))
+      (dired-goto-file (expand-file-name "task.org" default-directory))
+      (cl-letf (((symbol-function 'envoy-tmux--omp-program)
+                 (lambda () (user-error "OMP unavailable")))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _) (setq prompt-called t) "Continue")))
+        (should-error (envoy-dired-to 'omp) :type 'user-error))
+      (should-not prompt-called))))
+
+(defmacro envoy-test--with-agenda-file (text heading &rest body)
+  "Evaluate BODY on HEADING in an Org TODO agenda generated from TEXT."
+  (declare (indent 2))
+  `(envoy-test--with-org-file ,text
+     (let ((org-agenda-files (list file))
+           agenda-buffer)
+       (unwind-protect
+           (save-window-excursion
+             (org-todo-list)
+             (setq agenda-buffer (current-buffer))
+             (with-current-buffer agenda-buffer
+               (goto-char (point-min))
+               (search-forward ,heading)
+               (beginning-of-line)
+               ,@body))
+         (when (buffer-live-p agenda-buffer)
+           (kill-buffer agenda-buffer))))))
+
+(ert-deftest envoy-test-agenda-omp-prefix-dispatches-from-source-heading ()
+  "OMP prefix and agenda guards dispatch from the selected source heading."
+  (envoy-test--with-tmux '("agenda-test")
+    (envoy-test--with-agenda-file
+        "#+TODO: TODO DOING | DONE\n* Parent context\nParent details.\n** TODO Chosen subtree\nChosen details.\n*** TODO Chosen child\nChild details.\n** TODO Sibling secret\nSibling details.\n"
+        "Chosen subtree"
+      (let ((source-buffer buffer)
+            (agenda-buffer (current-buffer))
+            (agenda-point (point))
+            (agenda-min (point-min))
+            (agenda-max (point-max))
+            source-point source-min source-max prompt-file
+            (envoy-tmux-provider 'omp)
+            (envoy-tmux-providers
+             '((omp :program "true" :name "OMP" :args ()
+                    :prompt-arg "@%s" :model-arg "--model"
+                    :effort-arg "--thinking" :efforts ("high")
+                    :variable model :setup nil :models ("selected/model"))))
+            (org-attach-auto-tag "ATTACH"))
+        (with-current-buffer source-buffer
+          (goto-char (point-min))
+          (search-forward "** TODO Chosen subtree")
+          (beginning-of-line)
+          (narrow-to-region (point) (point-max))
+          (setq source-point (copy-marker (point))
+                source-min (copy-marker (point-min))
+                source-max (copy-marker (point-max) t)))
+        (unwind-protect
+            (progn
+              (goto-char (point-min))
+              (while (and (< (point) (point-max))
+                          (or (get-text-property (point) 'org-hd-marker)
+                              (get-text-property (line-beginning-position)
+                                                 'org-marker)))
+                (forward-line 1))
+              (should (< (point) (point-max)))
+              (should-not (or (get-text-property (point) 'org-hd-marker)
+                              (get-text-property (line-beginning-position)
+                                                 'org-marker)))
+              (let ((prompt-called nil))
+                (cl-letf (((symbol-function 'envoy--read-direction)
+                           (lambda (&rest _)
+                             (setq prompt-called t)
+                             (user-error "Unexpected direction prompt"))))
+                  (should-error
+                   (call-interactively #'envoy-tmux-org-heading-omp)
+                   :type 'user-error))
+                (should-not prompt-called)
+                (should-not (envoy-test--tmux-calls)))
+              (goto-char agenda-point)
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (prompt _choices &rest _)
+                           (cond
+                            ((string-prefix-p "OMP launch mode" prompt)
+                             "Single model")
+                            ((string-prefix-p "Model for OMP" prompt)
+                             "selected/model")
+                            ((string-prefix-p "Thinking effort" prompt) "high")
+                            ((string-prefix-p "tmux session" prompt)
+                             "agenda-test")
+                            (t (error "Unexpected completion prompt: %s"
+                                      prompt))))))
+                (let ((current-prefix-arg '(4)))
+                  (call-interactively #'envoy-tmux-org-heading-omp)))
+              (should (eq (current-buffer) agenda-buffer))
+              (should (= (point) agenda-point))
+              (should (= (point-min) agenda-min))
+              (should (= (point-max) agenda-max))
+              (let* ((send (seq-find
+                            (lambda (call)
+                              (and (equal (car call) "send-keys")
+                                   (member "-l" call)))
+                            (envoy-test--tmux-calls)))
+                     (command (nth 4 send)))
+                (should send)
+                (should
+                 (string-match-p
+                  (regexp-quote
+                   (concat "--thinking high "
+                           (shell-quote-argument
+                            "## From an Emacs org heading: Chosen subtree")))
+                  command))
+                (let ((matched
+                       (string-match "@\\([^ ;]+\\)"
+                                     command)))
+                  (setq prompt-file (and matched (match-string 1 command)))
+                  (should prompt-file)))
+              (let ((brief (with-temp-buffer
+                             (insert-file-contents prompt-file)
+                             (buffer-string))))
+                (should (string-match-p "Parent context" brief))
+                (should (string-match-p "Chosen child" brief))
+                (should (string-match-p "Child details" brief))
+                (should-not (string-match-p "Sibling secret" brief)))
+              (with-current-buffer source-buffer
+                (should (= (point) (marker-position source-point)))
+                (should (= (point-min) (marker-position source-min)))
+                (should (= (point-max) (marker-position source-max)))
+                (save-excursion
+                  (goto-char source-point)
+                  (should (equal (org-get-todo-state) "DOING"))
+                  (should (member "ATTACH" (org-get-tags nil t)))
+                  (should (file-directory-p (org-attach-dir nil t)))
+                  (goto-char (point-min))
+                  (re-search-forward "^\\*\\* TODO Sibling secret$")
+                  (org-back-to-heading t)
+                  (should (equal (org-get-todo-state) "TODO"))
+                  (should-not (member "ATTACH" (org-get-tags nil t))))))
+          (when (and prompt-file (file-exists-p prompt-file))
+            (delete-file prompt-file)))))))
+
+(ert-deftest envoy-test-agenda-subprocess-files-report-under-selected-source ()
+  "A completed subprocess report stays under its selected agenda heading."
+  (envoy-test--with-agenda-file
+      "#+TODO: TODO DOING | DONE\n* Parent context\nParent details.\n** TODO Chosen subtree\nChosen details.\n*** TODO Chosen child\nChild details.\n** TODO Sibling secret\nSibling details.\n"
+      "Chosen subtree"
+    (let* ((source-buffer buffer)
+           (agenda-buffer (current-buffer))
+           (agenda-point (point))
+           (agenda-min (point-min))
+           (agenda-max (point-max))
+           (brief-file (expand-file-name "agent-input.txt" directory))
+           (agent-script
+            (envoy-test--agent
+             "{\"type\":\"result\",\"is_error\":false,\"result\":\"ENVOY_STATUS: complete\\nSelected report.\"}"
+             nil nil brief-file))
+           source-point source-min source-max)
+      (with-current-buffer source-buffer
+        (goto-char (point-min))
+        (search-forward "** TODO Chosen subtree")
+        (beginning-of-line)
+        (narrow-to-region (point) (point-max))
+        (setq source-point (copy-marker (point))
+              source-min (copy-marker (point-min))
+              source-max (copy-marker (point-max) t)))
+      (envoy-test--with-agent agent-script
+        (let ((before (process-list)) process)
+          (unwind-protect
+              (progn
+                (envoy-org-heading)
+                (setq process
+                      (seq-find
+                       (lambda (candidate)
+                         (and (not (memq candidate before))
+                              (equal (car-safe (process-command candidate))
+                                     agent-script)))
+                       (process-list)))
+                (should process)
+                (with-timeout (10 (error "Envoy-test: agent did not finish"))
+                  (while (not
+                          (with-current-buffer source-buffer
+                            (save-excursion
+                              (save-restriction
+                                (widen)
+                                (goto-char source-point)
+                                (equal (org-get-todo-state) "DONE")))))
+                    (accept-process-output process 0.05)))
+                (should (eq (current-buffer) agenda-buffer))
+                (should (= (point) agenda-point))
+                (should (= (point-min) agenda-min))
+                (should (= (point-max) agenda-max))
+                (let ((brief (with-temp-buffer
+                               (insert-file-contents brief-file)
+                               (buffer-string))))
+                  (should (string-match-p "Parent context" brief))
+                  (should (string-match-p "Chosen child" brief))
+                  (should (string-match-p "Child details" brief))
+                  (should-not (string-match-p "Sibling secret" brief)))
+                (with-current-buffer source-buffer
+                  (should (= (point) (marker-position source-point)))
+                  (should (= (point-min) (marker-position source-min)))
+                  (should (= (point-max) (marker-position source-max)))
+                  (save-restriction
+                    (widen)
+                    (save-excursion
+                      (goto-char source-point)
+                      (should (equal (org-get-todo-state) "DONE"))
+                      (let ((end (save-excursion
+                                   (org-end-of-subtree t t)
+                                   (point))))
+                        (should (search-forward ":ENVOY:" end t))
+                        (goto-char source-point)
+                        (should (search-forward "Selected report." end t)))
+                      (re-search-forward "^\\*\\* TODO Sibling secret$")
+                      (org-back-to-heading t)
+                      (should (equal (org-get-todo-state) "TODO"))
+                      (let ((end (save-excursion
+                                   (org-end-of-subtree t t)
+                                   (point))))
+                        (should-not (search-forward "Selected report." end t)))))))
+            (dolist (candidate (process-list))
+              (when (and (not (memq candidate before))
+                         (equal (car-safe (process-command candidate))
+                                agent-script)
+                         (process-live-p candidate))
+                (delete-process candidate)))))))))

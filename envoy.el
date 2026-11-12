@@ -87,6 +87,12 @@ rewrite pass.  Whitespace-only values are ignored."
   :type '(choice (const :tag "None" nil) string)
   :group 'envoy)
 
+(defcustom envoy-default-direction
+  "Use your judgement to complete the ask. Think hard, be reasonable and logical, and ask me if you have any question."
+  "Direction used when a dispatch direction is left blank."
+  :type 'string
+  :group 'envoy)
+
 (defvar envoy--runs nil
   "Runs that have not finished, as an alist of (BUFFER . PROCESS).")
 
@@ -286,6 +292,12 @@ The numbered range remains the only part the agent may change."
     (when (string-empty-p (string-trim answer))
       (user-error "Envoy: no instruction given"))
     answer))
+
+(defun envoy--read-direction (prompt)
+  "Read a free-form direction from the minibuffer, PROMPT for it.
+Return the trimmed answer, or `envoy-default-direction' when it is blank."
+  (let ((answer (string-trim (read-string prompt))))
+    (if (string-empty-p answer) envoy-default-direction answer)))
 
 ;;;###autoload
 (defun envoy-rewrite (beg end instruction)

@@ -30,9 +30,10 @@ TEST_TIMEOUT_NON_DIGITS := $(subst 0,,$(subst 1,,$(subst 2,,$(subst 3,,$(subst 4
 # every CI runner.  One line each keeps both versions honest.
 
 # envoy.el must come after the two files it requires, then envoy-org.el,
-# envoy-tmux.el, and the optional notmuch adapter: byte-compiling a file
-# compiles what it requires as a side effect, without these warning settings.
-SRC  = envoy-process.el envoy-review.el envoy.el envoy-org.el envoy-tmux.el envoy-notmuch.el
+# envoy-tmux.el, the optional notmuch adapter, and the Dired adapter.
+# Byte-compiling a file compiles what it requires as a side effect, without
+# these warning settings.
+SRC  = envoy-process.el envoy-review.el envoy.el envoy-org.el envoy-tmux.el envoy-notmuch.el envoy-dired.el
 TEST = test/envoy-test.el
 ELC  = $(SRC:.el=.elc) $(TEST:.el=.elc)
 ifeq ($(strip $(TEST_TIMEOUT)),)
