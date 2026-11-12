@@ -26,7 +26,7 @@ A mail thread in notmuch goes to OMP. Mark the region, press `C-c C-x O`, type a
 
 `envoy-rewrite` takes a marked region and an instruction from the minibuffer. The brief names the file and the line range and includes three read-only context lines on each side, so the agent can match the style around the selection. Only the selected lines may change.
 
-`envoy-org-heading` treats the whole Org subtree as one task. Its brief includes the subtree, every ancestor heading that is not datetree scaffolding, and the attachment directories of the heading and its ancestors. The agent works in the project that owns the file and writes output to the heading's attachment directory. Envoy moves the heading to its configured done keyword only after successful delivery and an explicit complete report for the whole subtree.
+`envoy-org-heading` treats the whole Org subtree as one task. Its brief includes the subtree, every ancestor heading that is not datetree scaffolding, and the attachment directories of the heading and its ancestors. The agent works in the project that owns the file and writes output to the heading's attachment directory. Envoy moves the heading to its configured done keyword only after successful delivery and an explicit complete report for the whole subtree. Email requests go through `/email-draft` and end as verified drafts. A requested send runs only after you approve the harness's send confirmation.
 
 The ancestor walk is the point of the org commands. A task heading is almost never self-contained. The client, the budget, the deadline, the brief and what has already been ruled out sit two or three levels up. Sending the task alone sends the least informative part of it.
 

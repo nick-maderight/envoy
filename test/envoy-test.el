@@ -5127,7 +5127,7 @@ reference the agent must not act on."
                      (substring prompt support-start thread-start)))))))))
 
 (ert-deftest envoy-test-notmuch-brief-routes-authorization-gates-through-ask ()
-  "A mail brief tells the agent to ask for approval rather than park a change."
+  "A mail brief tells the agent to ask for approval instead of parking a change."
   (let ((prompt (envoy-notmuch--prompt
                  "Improve this" "id:m" "thread:t" "Body" "Body" nil)))
     (should (string-match-p "^APPROVALS$" prompt))
@@ -5137,7 +5137,7 @@ reference the agent must not act on."
                (string-match "^EMAIL SAFETY$" prompt)))))
 
 (ert-deftest envoy-test-org-brief-guard-names-the-user-as-dispatcher ()
-  "The outward-action guard says the user dispatched the brief, not that nobody did."
+  "The outward-action guard says the user dispatched the brief."
   (envoy-test--with-org "* TODO The task\nDo the thing.\n"
     (org-back-to-heading t)
     (let ((prompt (envoy-org-build-prompt
