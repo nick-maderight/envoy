@@ -396,6 +396,28 @@ much harder to see.  The message names the variable and never a value."
                     :type 'user-error)
       (should-not ran))))
 
+(ert-deftest envoy-test-dsh-completed-run-with-no-answer ()
+  "A completed turn counts as success even with nothing to say.
+The closing event is what says the run finished, so an empty answer, or
+a missing one, must not turn a finished run into a failed one."
+  (let ((result (envoy--result-from
+                 0 "{\"type\":\"final\",\"sessionId\":\"s\",\
+\"reason\":{\"kind\":\"completed\"},\"text\":\"\"}" "" 'dsh)))
+    (should (envoy-result-ok result))
+    (should (equal (envoy-result-text result) "")))
+  (let ((result (envoy--result-from
+                 0 "{\"type\":\"final\",\"sessionId\":\"s\",\
+\"reason\":{\"kind\":\"completed\"}}" "" 'dsh)))
+    (should (envoy-result-ok result))
+    (should (equal (envoy-result-text result) ""))))
+
+(ert-deftest envoy-test-bad-environment-entry-is-refused ()
+  "An environment entry that is not a pair is refused by name."
+  (let ((message (cadr (should-error
+                        (envoy--environment '(:environment ("not-a-pair")))
+                        :type 'user-error))))
+    (should (string-match-p "not-a-pair" message))))
+
 (ert-deftest envoy-test-dsh-run-end-to-end ()
   "A dsh-shaped run reaches the caller through the dsh reader.
 The stand-in prints a status line before its closing event, the way a

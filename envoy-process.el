@@ -236,6 +236,8 @@ its value, because a run that starts without a credential it needs only
 fails later, inside the agent, where the reason is much harder to see."
   (let (entries)
     (dolist (spec (plist-get plist :environment))
+      (unless (consp spec)
+        (user-error "Envoy: %S is not a variable and a command" spec))
       (let ((variable (car spec))
             (command (cdr spec))
             value)
@@ -321,13 +323,16 @@ STDOUT    everything it wrote to standard output"
   ok text status session cost turns stderr stdout)
 
 (defun envoy--dsh-final-p (event)
-  "Return non-nil when EVENT is the closing event of a dsh run."
+  "Return non-nil when EVENT is the closing event of a dsh run.
+The closing event carries the answer, and a run that has one has
+finished, so the answer is not required for the event to count: a
+completed run with an empty answer must still read as completed."
   (and (listp event)
        (cl-every (lambda (entry)
                    (and (consp entry) (symbolp (car entry))))
                  event)
        (equal (cdr (assq 'type event)) "final")
-       (stringp (cdr (assq 'text event)))))
+       (assq 'reason event)))
 
 (defun envoy--parse-dsh-final (stdout)
   "Return the closing `final' event in STDOUT as an alist, or nil.
@@ -353,7 +358,8 @@ closing message stands in for them.  A run with no closing event never
 got far enough to have one, and the last thing it said on standard error
 is the only account of why."
   (let* ((event (envoy--parse-dsh-final stdout))
-         (text (cdr (assq 'text event)))
+         (text (let ((answer (cdr (assq 'text event))))
+                 (and (stringp answer) answer)))
          (reason (cdr (assq 'reason event)))
          (kind (cdr (assq 'kind (and (listp reason) reason))))
          (failure (cdr (assq 'error (and (listp reason) reason))))
