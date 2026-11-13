@@ -65,7 +65,7 @@ dsh sessions live in the dsh web host that `dsh-web.service` runs on this machin
 
 ## dsh without a terminal
 
-dsh is also an agent `envoy-rewrite` and `envoy-org-heading` can run as a subprocess. `M-x envoy-select-provider` switches to it for the session. Setting `envoy-provider` to `dsh` in your init makes the choice stick. The heading shortcut for the subprocess transport is `C-c C-x A`, which sends a heading to dsh in a background run instead of a tmux window.
+dsh is also an agent `envoy-rewrite` and `envoy-org-heading` can run as a subprocess. `M-x envoy-select-provider` switches to it for the session. Setting `envoy-provider` to `dsh` in your init makes the choice stick. The subprocess command for a heading is `envoy-org-heading`, which `envoy-org-setup-keys` binds to `C-c C-x A` in Org and agenda buffers. A dispatch through dsh runs in the background instead of a tmux window.
 
 The provider runs `dsh --profile headless --json` and gives the brief on standard input. Envoy reads the run's closing event for the answer, the session id and how the turn ended. Only a zero exit with a `completed` turn counts as success. Two options travel on every command line. `--approval-policy never` keeps an unattended run from stopping at an approval card nobody will answer. For a run that may edit, `--permission-mode workspace-write` replaces the read-only mode. Writes then stay under the directory the run starts in.
 
