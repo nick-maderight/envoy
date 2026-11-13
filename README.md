@@ -195,6 +195,7 @@ The `mapcar` copy gives your settings their own plists instead of editing the qu
 | `envoy-model` | a model to ask for, or nil for the agent's own |
 | `envoy-deny-tools` | tools to deny, `'("Bash")` by default |
 | `envoy-timeout` | seconds before a run is given up on, 600 |
+| `envoy-environment-timeout` | seconds a provider's credential command may run before it is killed, 10 |
 | `envoy-review-display` | `'diff` or `'none` |
 | `envoy-rewrite-context-lines` | read-only context lines on each side, 3 |
 | `envoy-rewrite-extra-instructions` | text added to every rewrite brief, or nil |
