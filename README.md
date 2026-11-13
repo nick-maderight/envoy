@@ -82,7 +82,7 @@ A headless run takes its model from its profile. The entry offers no `:model-arg
         '(("DEEPSEEK_API_KEY" . "my-key-command"))))
 ```
 
-The command runs when a dispatch starts, which sends a rotated key to the next run without a restart. A command that fails or prints nothing stops the run before the agent starts. The message names the variable and leaves the value out.
+The command runs when a dispatch starts, which sends a rotated key to the next run without a restart. A command that fails, prints nothing, or outlasts `envoy-environment-timeout` stops the run before the agent starts. The message names the variable and leaves the value out.
 
 dsh has no option that takes a tool away. `envoy-can-deny-tools-p` is nil for it. `envoy-rewrite` then asks before it starts, the same as reasonix. To stop a rewrite running shell commands, turn off `tool-bash` in the headless profile.
 

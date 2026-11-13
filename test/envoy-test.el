@@ -418,6 +418,21 @@ a missing one, must not turn a finished run into a failed one."
                         :type 'user-error))))
     (should (string-match-p "not-a-pair" message))))
 
+
+(ert-deftest envoy-test-environment-command-is-stopped-at-the-timeout ()
+  "A credential command that does not return is killed, not waited on.
+A command that prompts, or one that calls back into this Emacs, never
+returns on its own.  Waiting on it would freeze the whole of Emacs, so
+the dispatch gives up and names the variable."
+  (let ((envoy-environment-timeout 1)
+        (started (float-time)))
+    (let ((message (cadr (should-error
+                          (envoy--environment
+                           '(:environment (("ENVOY_TEST_HANG" . "sleep 30"))))
+                          :type 'user-error))))
+      (should (string-match-p "ENVOY_TEST_HANG" message))
+      (should (< (- (float-time) started) 15)))))
+
 (ert-deftest envoy-test-dsh-run-end-to-end ()
   "A dsh-shaped run reaches the caller through the dsh reader.
 The stand-in prints a status line before its closing event, the way a
@@ -454,7 +469,9 @@ real run does, and reports the credential it was handed."
 (ert-deftest envoy-test-environment-failure-starts-nothing ()
   "A run whose credential command failed never starts an agent.
 The provider here would otherwise start, so the refusal has to happen
-before the process exists rather than being reported afterwards."
+before the process exists rather than being reported afterwards.  Only
+the agent's own process counts: the credential command is a process too,
+and it is the one that fails."
   (let ((envoy-providers (list (list 'test
                                      :program "/bin/true"
                                      :name "test"
@@ -465,9 +482,13 @@ before the process exists rather than being reported afterwards."
                                      :environment
                                      '(("ENVOY_TEST_MISSING" . "exit 4")))))
         (envoy-provider 'test)
+        (real (symbol-function 'make-process))
         started)
     (cl-letf (((symbol-function 'make-process)
-               (lambda (&rest _) (setq started t))))
+               (lambda (&rest args)
+                 (when (equal (plist-get args :name) "envoy")
+                   (setq started t))
+                 (apply real args))))
       (should-error (envoy-run "do something" #'ignore) :type 'user-error))
     (should-not started)))
 

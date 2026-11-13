@@ -178,6 +178,15 @@ stays written.  See `envoy-rewrite' for what happens next."
   :type 'integer
   :group 'envoy)
 
+(defcustom envoy-environment-timeout 10
+  "Seconds one environment command may run before it is stopped.
+A provider's `:environment' commands fetch credentials, and one that
+prompts for a passphrase, or that calls back into this Emacs, does not
+return on its own.  A dispatch that waits for it freezes everything else
+in Emacs with it, so a command that outlasts this is killed."
+  :type 'integer
+  :group 'envoy)
+
 (defun envoy--provider (&optional provider)
   "Return the plist for PROVIDER, or for `envoy-provider'."
   (let* ((key (or provider envoy-provider))
@@ -226,38 +235,75 @@ files, and the arguments that deny `envoy-deny-tools'."
   "Return non-nil when PROVIDER can be told not to use a tool."
   (and (plist-get (envoy--provider provider) :deny-arg) t))
 
+(defun envoy--environment-value (variable command)
+  "Return what COMMAND prints for VARIABLE, or signal a `user-error'.
+The command runs as its own process so that waiting for it can give up.
+Nothing in it is shown: a failure names the variable and the status, and
+a command that outlasts `envoy-environment-timeout' is killed before it
+can hold the dispatch."
+  (let* ((buffer (generate-new-buffer " *envoy-environment*"))
+         (errors (generate-new-buffer " *envoy-environment-stderr*"))
+         (stderr (make-pipe-process :name " *envoy-environment-stderr*"
+                                    :buffer errors
+                                    :noquery t))
+         (process (make-process
+                   :name "envoy-environment"
+                   :command (list shell-file-name shell-command-switch command)
+                   :buffer buffer
+                   :coding 'utf-8-unix
+                   :noquery t
+                   ;; Without a sentinel of its own the default one writes
+                   ;; "Process ... finished" into the buffer, and that line
+                   ;; would become part of the value.
+                   :sentinel #'ignore
+                   :stderr stderr))
+         (deadline (+ (float-time) (max 1 envoy-environment-timeout))))
+    (unwind-protect
+        (progn
+          (while (and (process-live-p process) (< (float-time) deadline))
+            (accept-process-output process 0.05))
+          (cond
+           ((process-live-p process)
+            (delete-process process)
+            (user-error
+             "Envoy: the command providing %s did not finish in %s seconds"
+             variable envoy-environment-timeout))
+           ((not (zerop (process-exit-status process)))
+            (user-error "Envoy: the command providing %s failed (%s)"
+                        variable (process-exit-status process)))
+           (t
+            ;; Both pipes can still hold output after the child is gone.
+            (while (accept-process-output process 0.05))
+            (string-trim (with-current-buffer buffer (buffer-string))))))
+      (when (process-live-p process) (delete-process process))
+      (when (process-live-p stderr) (delete-process stderr))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (when (buffer-live-p errors) (kill-buffer errors)))))
+
 (defun envoy--environment (plist)
   "Return the extra environment entries PLIST asks for.
 Each is a pair of a variable name and a shell command.  The command is
 run now and its trimmed output becomes the variable's value for the
 agent, keyed the way `process-environment' wants it.  A command that
-fails or prints nothing is a `user-error' naming the variable and not
-its value, because a run that starts without a credential it needs only
-fails later, inside the agent, where the reason is much harder to see."
+fails, prints nothing, or outlasts `envoy-environment-timeout' is a
+`user-error' naming the variable and not its value, because a run that
+starts without a credential it needs only fails later, inside the agent,
+where the reason is much harder to see."
   (let (entries)
     (dolist (spec (plist-get plist :environment))
       (unless (consp spec)
         (user-error "Envoy: %S is not a variable and a command" spec))
       (let ((variable (car spec))
-            (command (cdr spec))
-            value)
+            (command (cdr spec)))
         (unless (and (stringp variable)
                      (string-match-p "\\`[A-Za-z_][A-Za-z0-9_]*\\'" variable))
           (user-error "Envoy: %S is not an environment variable name" variable))
-        (setq value
-              (with-temp-buffer
-                (let ((status (call-process-shell-command command nil t)))
-                  (unless (and (integerp status) (zerop status))
-                    (user-error
-                     "Envoy: the command providing %s failed (%s)"
-                     variable status))
-                  (string-trim (buffer-string)))))
-        (when (string-empty-p value)
-          (user-error "Envoy: the command providing %s printed nothing"
-                      variable))
-        (push (concat variable "=" value) entries)))
+        (let ((value (envoy--environment-value variable command)))
+          (when (string-empty-p value)
+            (user-error "Envoy: the command providing %s printed nothing"
+                        variable))
+          (push (concat variable "=" value) entries))))
     (nreverse entries)))
-
 (defun envoy--parse-json (string)
   "Parse STRING as JSON into an alist, or return nil.
 Absent values come back as nil rather than as a sentinel, so a caller
