@@ -5279,6 +5279,11 @@ reference the agent must not act on."
                    (lambda (provider)
                      (should (eq provider 'omp))
                      (list :model "planner" :plan-into "executor")))
+                  ;; No agent is installed where this suite runs, so the
+                  ;; dispatch resolves this stand-in instead.  Nothing here
+                  ;; starts it: `envoy-tmux-send' below records the brief.
+                  ((symbol-function 'envoy-tmux--omp-program)
+                   (lambda () "true"))
                   ((symbol-function 'envoy--read-direction)
                    (lambda (&rest _) "Improve this"))
                   ((symbol-function 'envoy-tmux-read-session)
