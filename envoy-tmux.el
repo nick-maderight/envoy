@@ -35,6 +35,11 @@
 ;; The list is fetched for every dispatch rather than cached.  A session
 ;; started or killed in a terminal between two dispatches is the ordinary case.
 ;; Nothing chooses one for you.
+;;
+;; dsh is the exception.  Its sessions live in the dsh web host, so there is
+;; nothing to attach to: Envoy starts `dsh-launch' as its own process, asks for
+;; no session, and leaves the status lines in a buffer.  See "dsh without tmux"
+;; below.
 
 ;; Sessions are matched exactly, with tmux's `=' prefix.  Without it a
 ;; target is a session id, then an exact name, then a prefix of a name,
@@ -160,7 +165,7 @@ One of the keys of `envoy-tmux-providers'."
      :variable model
      :setup nil
      :models ("deepseek-flash" "deepseek-v4-pro")))
-  "Agents envoy knows how to start in a tmux window.
+  "Agents envoy knows how to start, in a tmux window or in dsh's web host.
 Each entry is (SYMBOL . PLIST).  The properties are:
 
 :program     the executable, looked up on the variable `exec-path'
@@ -1168,10 +1173,139 @@ choice."
          (file-exists-p file)
          (equal token (envoy-org--spool-claim-token file)))))
 
+;;; dsh without tmux
+
+;; dsh keeps its sessions in the web host, so the tmux window around
+;; `dsh-launch' bought nothing but a place to watch status lines.  Envoy
+;; starts `dsh-launch' itself and leaves its output in a buffer, which also
+;; lets every Envoy launch name the workspace its session joins.
+
+(defcustom envoy-dsh-workspace "Envoy"
+  "The dsh workspace every session Envoy starts joins.
+The workspace is a directory under `~/.dsh/workspaces' and a group in the dsh
+web UI.  A nil or empty value leaves the session in the directory it was
+started from."
+  :type '(choice (const :tag "Launch directory" nil) string)
+  :group 'envoy)
+
+(defun envoy-dsh--command (prompt-file &optional model plan-into system-file
+                                       effort)
+  "Return the argv list for starting dsh-launch on PROMPT-FILE.
+MODEL selects the single model, PLAN-INTO selects planner and executor mode
+and EFFORT its thinking effort.  SYSTEM-FILE is the report contract."
+  (when (and model (string-empty-p model))
+    (user-error "Envoy: the dsh model selection is empty"))
+  (when (and plan-into (not (and model (not (string-empty-p model)))))
+    (user-error "Envoy: dsh plan mode needs a planner model"))
+  (when (and effort (string-empty-p effort))
+    (user-error "Envoy: the dsh effort selection is empty"))
+  (let* ((plist (envoy-tmux--provider 'dsh))
+         (args (plist-get plist :args))
+         (workspace-configured
+          (or (member "--workspace" args)
+              (seq-some (lambda (arg) (string-prefix-p "--workspace=" arg))
+                        args))))
+    (append
+     (list (envoy-tmux--provider-program 'dsh))
+     (when (and (stringp envoy-dsh-workspace)
+                (not (string-empty-p envoy-dsh-workspace))
+                (not workspace-configured))
+       (list "--workspace" envoy-dsh-workspace))
+     args
+     (when model (list "--model" model))
+     (when plan-into (list "--plan-yolo" "--plan-yolo-into" plan-into))
+     (when effort (list "--thinking" effort))
+     (when system-file
+       (list (concat "--append-system-prompt=" system-file)))
+     (list (concat "@" prompt-file)))))
+
+(defun envoy-dsh--write-failed (claim)
+  "Publish CLAIM's incomplete report when it exited without a marker.
+Only a run that still owns its claim and has neither marker publishes, so a
+report the agent wrote, or one another run wrote, is left alone."
+  (let ((key (plist-get claim :key))
+        (token (plist-get claim :token)))
+    (when (and key token (envoy-tmux--claim-owned-p claim))
+      (let ((done (envoy-org--spool-file key envoy-org--spool-done-suffix))
+            (failed (envoy-org--spool-file
+                     key envoy-org--spool-failed-suffix)))
+        (when (and (not (file-exists-p done))
+                   (not (file-exists-p failed)))
+          (let ((temporary
+                 (envoy-org--spool-file key (format ".exit-%s.tmp" token))))
+            (with-temp-file temporary
+              (insert "ENVOY_STATUS: incomplete\n"
+                      "The agent exited without publishing a report.\n"))
+            (set-file-modes temporary #o600)
+            (rename-file temporary failed t)))))))
+
+(defun envoy-dsh--finish (process prompt-file system-file claim)
+  "Finish dsh PROCESS once, removing PROMPT-FILE and SYSTEM-FILE.
+The fallback for CLAIM is applied here.  A sentinel and a polling timer both
+call this, because Emacs does not reliably deliver a sentinel for a child that
+exits almost at once."
+  (unless (process-get process 'envoy-dsh-finished)
+    (process-put process 'envoy-dsh-finished t)
+    (let ((timer (process-get process 'envoy-dsh-timer)))
+      (when (timerp timer)
+        (cancel-timer timer)))
+    (dolist (file (list prompt-file system-file))
+      (when (and file (file-exists-p file))
+        (ignore-errors (delete-file file))))
+    (envoy-dsh--write-failed claim)))
+
+(defun envoy-dsh-send (title prompt model plan-into claim effort on-start)
+  "Start dsh-launch for TITLE with PROMPT and return its buffer name.
+MODEL, PLAN-INTO and EFFORT select the launch as `envoy-dsh--command' takes
+them.  CLAIM is the heading's spool claim, or nil for a file or mail task.
+ON-START is called once the process exists.  The session belongs to the dsh
+web host, in `envoy-dsh-workspace'; no tmux is involved."
+  (envoy--check-brief prompt)
+  (let ((prompt-file (envoy-tmux--write-prompt prompt))
+        system-file buffer process timer)
+    (setq system-file
+          (and claim (plist-get claim :key)
+               (envoy-tmux--write-prompt
+                (envoy-org-report-contract (plist-get claim :key)))))
+    (setq buffer (generate-new-buffer (format "*dsh: %s*" title)))
+    (unwind-protect
+        (progn
+          (setq process
+                (make-process
+                 :name "envoy-dsh"
+                 :buffer buffer
+                 :command (envoy-dsh--command prompt-file model plan-into
+                                              system-file effort)
+                 :connection-type 'pipe
+                 :coding 'utf-8-unix
+                 :noquery t
+                 :sentinel
+                 (lambda (proc _event)
+                   (when (memq (process-status proc) '(exit signal))
+                     (envoy-dsh--finish proc prompt-file system-file claim)))))
+          (setq timer
+                (run-at-time
+                 0.5 0.5
+                 (lambda ()
+                   (when (memq (process-status process) '(exit signal))
+                     (envoy-dsh--finish process prompt-file system-file
+                                        claim)))))
+          (process-put process 'envoy-dsh-timer timer)
+          (when on-start
+            (funcall on-start))
+          (buffer-name buffer))
+      (unless process
+        (dolist (file (list prompt-file system-file))
+          (when (and file (file-exists-p file))
+            (ignore-errors (delete-file file))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (defun envoy-tmux-org-heading-to (provider &optional model setup plan-into
                                              session select direction effort)
-  "Hand an Org heading or selected agenda entry to PROVIDER in tmux.
-MODEL, SETUP, PLAN-INTO and EFFORT are as in `envoy-tmux-command'.  SESSION
+  "Hand an Org heading or selected agenda entry to PROVIDER.
+dsh runs in its web host; every other provider runs in tmux.  MODEL, SETUP,
+PLAN-INTO and EFFORT are as in `envoy-tmux-command'.  SESSION
 is the name to use, or nil to ask for one.  When SELECT is non-nil, ask for the
 provider's model, setup or effort after the direction.
 
@@ -1186,7 +1320,8 @@ or keyword update fails.
 The brief is the same one `envoy-org-heading' sends: the whole subtree,
 every ancestor heading that is not datetree scaffolding, and the attachment
 directories of the heading and of those ancestors.  What differs is the
-delivery.  The agent runs in a terminal you can attach to and answer."
+delivery.  The agent runs in a terminal you can attach to and answer, or,
+for dsh, in the dsh web host with its output in a buffer."
   (if (derived-mode-p 'org-agenda-mode)
       (envoy-org--with-agenda-heading #'envoy-tmux-org-heading-to
                                       provider model setup plan-into
@@ -1238,8 +1373,9 @@ delivery.  The agent runs in a terminal you can attach to and answer."
                         setup (plist-get choice :setup)
                         plan-into (plist-get choice :plan-into)
                         effort (plist-get choice :effort))))
-              (setq session (or session (envoy-tmux-read-session provider)))
-              (setq target (envoy-tmux-window session title))
+              (unless (eq provider 'dsh)
+                (setq session (or session (envoy-tmux-read-session provider)))
+                (setq target (envoy-tmux-window session title)))
               (when (buffer-modified-p)
                 (save-buffer))
               (setq attach-tag
@@ -1262,14 +1398,22 @@ delivery.  The agent runs in a terminal you can attach to and answer."
                      (spool-key (envoy-org--spool-open title task-files))
                      (prompt (envoy-org-build-prompt title subtree attach-dir
                                                      task-files spool-key direction)))
-                (envoy-tmux-send
-                 target prompt provider model setup plan-into
-                 (lambda () (setq launched t)) claim effort)
+                (if (eq provider 'dsh)
+                    (setq target
+                          (envoy-dsh-send
+                           title prompt model plan-into claim effort
+                           (lambda () (setq launched t))))
+                  (envoy-tmux-send
+                   target prompt provider model setup plan-into
+                   (lambda () (setq launched t)) claim effort))
                 (setq launched t)
                 (when (envoy-tmux--claim-owned-p claim)
                   (envoy-org--set-keyword envoy-org-active-keyword)))
-              (message "Envoy: %s has \"%s\" in tmux %s"
-                       (envoy-tmux-provider-name provider) title target)
+              (if (eq provider 'dsh)
+                  (message "Envoy: dsh has \"%s\" in workspace %s (%s)"
+                           title envoy-dsh-workspace target)
+                (message "Envoy: %s has \"%s\" in tmux %s"
+                         (envoy-tmux-provider-name provider) title target))
               target)
           (unless launched
             (when (envoy-tmux--claim-owned-p claim)
@@ -1367,9 +1511,9 @@ level afterwards."
 
 ;;;###autoload
 (defun envoy-tmux-org-heading-dsh (&optional arg)
-  "Hand the org heading to dsh in tmux, asking for direction first.
-With a prefix argument ARG, ask for Single model or Plan into and an effort
-level afterwards."
+  "Hand the org heading to dsh in its web host, asking for direction first.
+No tmux session is asked for.  With a prefix argument ARG, ask for Single
+model or Plan into and an effort level afterwards."
   (interactive "P")
   (envoy-tmux--dispatch 'dsh arg))
 

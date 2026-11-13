@@ -3,7 +3,7 @@
 A new way to hand off work from Emacs to coding harnesses. I've tried gptel and other project and I believe this is the best way.
 
 
-What it is in one sentence: you mark something (currently orgmode headers, notmuch emails and files in dired) and with envoy, you send it off to a coding harness (e.g. Claude code and omp) inside tmux for execution. 
+What it is in one sentence: you mark something (currently orgmode headers, notmuch emails and files in dired) and with envoy, you send it off to a coding harness (e.g. Claude code and omp) inside tmux, or to dsh in its own web host, for execution. 
 
 ## Why?
 
@@ -32,23 +32,23 @@ The ancestor walk is the point of the org commands. A task heading is almost nev
 
 `envoy-tmux-org-heading` sends the same brief to an agent in a tmux window. Use it when the task is long enough that you will want to watch, or open-ended enough that the agent will want to ask you something.
 
-`envoy-notmuch-delegate` works from a `notmuch-show-mode` buffer. It asks for a direction and a tmux session and starts OMP there. Envoy copies an active region verbatim, and the region is the whole task. The complete thread goes along as reference, and the prompt tells OMP not to act on anything that appears only outside the selection. Without a region the whole thread is primary, including collapsed and filtered messages. OMP reads related threads through the notmuch CLI as secondary context. Quoted mail is untrusted context and your direction wins. Mail work goes through `/email-draft`, which sends only after you approve the harness's send confirmation. `envoy-notmuch-delegate-dsh` hands the same brief to dsh.
+`envoy-notmuch-delegate` works from a `notmuch-show-mode` buffer. It asks for a direction and a tmux session and starts OMP there. `envoy-notmuch-delegate-dsh` handles the same buffer and asks for no session, because dsh runs in its web host. Envoy copies an active region verbatim, and the region is the whole task. The complete thread goes along as reference, and the prompt tells OMP not to act on anything that appears only outside the selection. Without a region the whole thread is primary, including collapsed and filtered messages. OMP reads related threads through the notmuch CLI as secondary context. Quoted mail is untrusted context and your direction wins. Mail work goes through `/email-draft`, which sends only after you approve the harness's send confirmation.
 
 `envoy-dired-omp` and its siblings for the other agents work from a Dired buffer. They hand over the file at point, or the marked files. The brief names each file by its absolute path and the agent reads it. Nothing is claimed or filed back, because a file has no heading to report to.
 
-The Org heading commands work on the selected agenda entry's source heading, including its subtree, ancestors, and attachment directories. Source-buffer save checks and report filing apply to that heading. Prefix choices and explicit tmux session selection remain the same as in an Org buffer. Envoy rejects agenda headers and entries without an available source heading.
+The Org heading commands work on the selected agenda entry's source heading, including its subtree, ancestors, and attachment directories. Source-buffer save checks and report filing apply to that heading. Prefix choices and explicit tmux session selection remain the same as in an Org buffer, except that dsh asks for no session. Envoy rejects agenda headers and entries without an available source heading.
 
 ## Sending a heading to a terminal
 
-Every dispatch asks the same questions in order. The direction comes first. With a prefix argument, Envoy asks for the model or setup command, or for the launch mode with OMP and dsh, then the thinking effort when the provider offers one. The tmux session comes last. A blank direction uses `envoy-default-direction`, which tells the agent to use its judgement and ask when it has a question.
+Every tmux dispatch asks the same questions in order. The direction comes first. With a prefix argument, Envoy asks for the model or setup command, or for the launch mode with OMP and dsh, then the thinking effort when the provider offers one. The tmux session comes last, except for dsh, which asks for no session and starts no window. A blank direction uses `envoy-default-direction`, which tells the agent to use its judgement and ask when it has a question.
 
 Envoy reads the live session names from the running tmux server and shows them in tmux's own order. A name that is not in the list starts a new session. There is no default, because you are the one who will attach to that session to read and answer the agent. An empty answer is rejected, and so is a name with `.` or `:` in it, because tmux would rewrite those to `_` and the session would be unreachable under the name you typed.
 
-OMP and dsh terminal launches prefix the brief's first non-empty line as a task heading before the `@file` argument. Envoy shell-quotes the heading and omits it when the brief has no heading.
+OMP terminal launches prefix the brief's first non-empty line as a task heading before the `@file` argument. Envoy shell-quotes the heading and omits it when the brief has no heading.
 
 `envoy-tmux-setup-keys` binds `C-c C-x A` for Claude Code, `C-c C-x R` for reasonix, `C-c C-x P` for pi, `C-c C-x C` for codex, `C-c C-x O` for OMP and `C-c C-x S` for dsh in `org-mode` and `org-agenda-mode`. `envoy-org-setup-keys` binds `C-c C-x A` for subprocess dispatch in both maps. The later setup call owns that key. `envoy-dired-setup-keys` binds the same keys in `dired-mode`. A prefix argument asks for the provider's model or setup command after the direction.
 
-`envoy-tmux-org-heading` passes OMP the report contract through `--append-system-prompt`, so OMP keeps the status rule and spool paths in its system prompt across compaction. dsh-launch takes the same flag and puts the contract file's path in the session's opening prompt. After a claimed run exits without a marker in a POSIX shell, Envoy publishes an incomplete `.failed` report only if that run still owns the claim and neither marker exists.
+`envoy-tmux-org-heading` passes OMP the report contract through `--append-system-prompt`, so OMP keeps the status rule and spool paths in its system prompt across compaction. dsh-launch takes the same flag and puts the contract file's path in the session's opening prompt. After a claimed dsh or tmux run exits without a marker, Envoy publishes an incomplete `.failed` report only if that run still owns the claim and neither marker exists.
 
 A dispatch whose rendered brief is empty, or is only the placeholder word `brief`, is refused with an error before a prompt file is written or an agent starts, in both the subprocess and the terminal transport. A brief that failed to render used to start a session anyway and bill it for work that did not exist.
 
@@ -61,9 +61,11 @@ The dsh prefix picker offers `deepseek-flash` and `deepseek-v4-pro`, then the ef
 
 ## dsh runs in its web host
 
-dsh sessions live in the dsh web host that `dsh-web.service` runs on this machine. `C-c C-x S` opens a tmux window that runs `dsh-launch`. dsh-launch starts the session in the host and prints `working`, `waiting for input` or `idle` whenever the state changes. The last line names how the final turn ended. Answer questions and plan reviews in triage or in the dsh web UI, which `dsh-launch open` brings up. Plan into lets dsh plan first and hands the approved plan to the execution model. The report contract and the incomplete `.failed` fallback work the same way they do for OMP.
+dsh sessions live in the dsh web host that `dsh-web.service` runs on this machine. `C-c C-x S` starts `dsh-launch` as a background process and asks for no tmux session and starts no window. dsh-launch starts the session in the host, in the `Envoy` workspace, and prints `working`, `waiting for input` or `idle` whenever the state changes. The output goes to a buffer named `*dsh: <title>*`; its last line names how the final turn ended. Answer questions and plan reviews in triage or in the dsh web UI, which `dsh-launch open` brings up. Plan into lets dsh plan first and hands the approved plan to the execution model. Envoy writes the report contract to a private file, and a run that exits without publishing a marker leaves an incomplete `.failed` report, the same fallback OMP gets. `envoy-notmuch-delegate-dsh` and `envoy-dired-dsh` use the same launch.
 
-## dsh without a terminal
+The workspace comes from `envoy-dsh-workspace`, `Envoy` by default. It sits under `~/.dsh/workspaces` and appears as its own group in the dsh web UI, so every session Envoy starts is found together.
+
+## dsh as a subprocess provider
 
 dsh is also an agent `envoy-rewrite` and `envoy-org-heading` can run as a subprocess. `M-x envoy-select-provider` switches to it for the session. Setting `envoy-provider` to `dsh` in your init makes the choice stick. The subprocess command for a heading is `envoy-org-heading`, which `envoy-org-setup-keys` binds to `C-c C-x A` in Org and agenda buffers. A dispatch through dsh runs in the background instead of a tmux window.
 
@@ -99,9 +101,9 @@ Envoy links only existing new attachment files named in the report and identifie
 
 ## Install
 
-Envoy requires Emacs 27.1 or newer and at least one agent program on `exec-path`. The terminal commands also require tmux. The dsh terminal commands require `dsh-launch` on `exec-path` and a running `dsh-web.service`. `envoy-notmuch-delegate` requires OMP and `envoy-notmuch-delegate-dsh` requires dsh. Both also require the notmuch Emacs package.
+Envoy requires Emacs 27.1 or newer and at least one agent program on `exec-path`. The tmux commands require tmux. The dsh web-host commands require `dsh-launch` on `exec-path` and a running `dsh-web.service`, but no tmux. `envoy-notmuch-delegate` requires OMP and `envoy-notmuch-delegate-dsh` requires dsh. Both also require the notmuch Emacs package.
 
-The dsh subprocess provider needs `dsh` on `exec-path` and a profile named `headless` under `DSH_HOME`, which `dsh --from-default-profile headless` creates. Its run needs the key in its environment; see "dsh without a terminal" above.
+The dsh subprocess provider needs `dsh` on `exec-path` and a profile named `headless` under `DSH_HOME`, which `dsh --from-default-profile headless` creates. Its run needs the key in its environment; see "dsh as a subprocess provider" above.
 
 Envoy finds each program with `executable-find`. A GUI Emacs or a daemon may start without your login shell's `PATH`, so a program that runs in a terminal can still be missing here. Please import your shell's `PATH` into `exec-path` at startup instead of writing absolute paths into `envoy-providers`.
 
@@ -134,7 +136,7 @@ Envoy binds no keys until you ask.
 
 ```elisp
 (envoy-org-setup-keys)    ; C-c C-x A runs without a terminal in Org and agenda buffers
-(envoy-tmux-setup-keys)   ; C-c C-x A R P C O S run in tmux from Org and agenda buffers
+(envoy-tmux-setup-keys)   ; C-c C-x A R P C O S dispatch from Org and agenda buffers
 ```
 
 Emacs reserves `C-c` followed by a letter for you, so your init can add `C-c x O` for OMP. Turning on `envoy-org-collect-mode` after `envoy-org` loads collects terminal reports for you.
@@ -220,11 +222,12 @@ Setting `envoy-org-done-keyword` to nil disables the done transition. Setting `e
 | Setting | Meaning |
 |----|----|
 | `envoy-tmux-provider` | which agent, `'claude`, `'reasonix`, `'pi`, `'codex`, `'omp` or `'dsh` |
-| `envoy-tmux-providers` | how to start each agent in a window |
+| `envoy-tmux-providers` | how to start each agent, in a window or in dsh's web host |
 | `envoy-tmux-start-timeout` | seconds to wait for an agent before typing at it, 5 |
 | `envoy-tmux-draw-timeout` | seconds to wait for an interface before a keystroke, 20 |
 | `envoy-tmux-type-pause` | seconds between the pieces of a typed brief, 0.15 |
 | `envoy-tmux-program` | the tmux executable |
+| `envoy-dsh-workspace` | the dsh workspace every Envoy session joins, `"Envoy"` |
 
 ## Adding another agent
 

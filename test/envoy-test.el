@@ -3225,32 +3225,113 @@ being separate functions."
                      '(("Single model" "Plan into")
                        ("Single model" "Plan into")))))))
 
-(ert-deftest envoy-test-tmux-dsh-single-model-names-model-and-effort ()
-  "A dsh launch passes its model and thinking effort to dsh-launch."
+(ert-deftest envoy-test-dsh-command-names-model-effort-and-workspace ()
+  "A dsh launch passes its model, effort and workspace to dsh-launch."
   (let ((envoy-tmux-providers
          '((dsh :program "true" :name "dsh" :args ()
                 :prompt-arg "@%s" :model-arg "--model"
                 :effort-arg "--thinking" :efforts ("off" "low" "high" "max")
                 :variable model :setup nil
-                :models ("deepseek-flash" "deepseek-v4-pro")))))
-    (should (equal (envoy-tmux-command "/tmp/brief" 'dsh "deepseek-v4-pro"
-                                       nil nil nil "high")
-                   (format "%s --model deepseek-v4-pro --thinking high @/tmp/brief"
-                           (executable-find "true"))))))
+                :models ("deepseek-flash" "deepseek-v4-pro"))))
+        (envoy-dsh-workspace "Envoy"))
+    (should (equal (envoy-dsh--command "/tmp/brief" "deepseek-v4-pro"
+                                       nil nil "high")
+                   (list (executable-find "true")
+                         "--workspace" "Envoy"
+                         "--model" "deepseek-v4-pro"
+                         "--thinking" "high"
+                         "@/tmp/brief")))))
 
-(ert-deftest envoy-test-tmux-dsh-plan-into-names-planner-and-executor ()
+(ert-deftest envoy-test-dsh-plan-into-names-planner-and-executor ()
   "A dsh plan-into launch names the planner and the executor to dsh-launch."
   (let ((envoy-tmux-providers
          '((dsh :program "true" :name "dsh" :args ()
                 :prompt-arg "@%s" :model-arg "--model"
                 :effort-arg "--thinking" :efforts ("off" "low" "high" "max")
                 :variable model :setup nil
-                :models ("deepseek-flash" "deepseek-v4-pro")))))
-    (should (equal (envoy-tmux-command "/tmp/brief" 'dsh "deepseek-v4-pro"
-                                       nil "deepseek-flash")
-                   (format (concat "%s --model deepseek-v4-pro --plan-yolo"
-                                   " --plan-yolo-into deepseek-flash @/tmp/brief")
-                           (executable-find "true"))))))
+                :models ("deepseek-flash" "deepseek-v4-pro"))))
+        (envoy-dsh-workspace "Envoy"))
+    (should (equal (envoy-dsh--command "/tmp/brief" "deepseek-v4-pro"
+                                       "deepseek-flash" nil nil)
+                   (list (executable-find "true")
+                         "--workspace" "Envoy"
+                         "--model" "deepseek-v4-pro"
+                         "--plan-yolo" "--plan-yolo-into" "deepseek-flash"
+                         "@/tmp/brief")))))
+
+(ert-deftest envoy-test-dsh-send-starts-dsh-launch-without-tmux ()
+  "DSH runs as its own process, names the workspace and leaves a buffer."
+  (let* ((argv-file (make-temp-file "envoy-test-dsh-argv-"))
+         (script (make-temp-file "envoy-test-dsh-launch-" nil ".sh"))
+         (envoy-tmux-providers
+          (list (list 'dsh :program script :name "dsh" :args ()
+                      :prompt-arg "@%s" :model-arg "--model"
+                      :effort-arg "--thinking" :efforts () :variable 'model
+                      :setup nil :models ())))
+         (envoy-dsh-workspace "Envoy")
+         (envoy-org-spool-directory
+          (make-temp-file "envoy-test-dsh-spool-" t))
+         buffer)
+    (unwind-protect
+        (progn
+          (with-temp-file script
+            (insert "#!/bin/sh\n"
+                    (format "printf '%%s\\n' \"$@\" > %s\n"
+                            (shell-quote-argument argv-file))
+                    "exit 0\n"))
+          (set-file-modes script #o755)
+          (setq buffer
+                (envoy-dsh-send "The task" "Do the task." "deepseek-flash"
+                                nil nil "high" nil))
+          (let ((process (get-buffer-process buffer))
+                (deadline (+ (float-time) 5)))
+            (while (and process (process-live-p process)
+                        (< (float-time) deadline))
+              (accept-process-output process 0.05)))
+          (with-temp-buffer
+            (insert-file-contents argv-file)
+            (let ((lines (split-string (buffer-string) "\n" t)))
+              (should (equal (seq-take lines 4)
+                             '("--workspace" "Envoy" "--model"
+                               "deepseek-flash")))
+              (should (member "--thinking" lines))
+              (should (member "high" lines))
+              (should (string-prefix-p "@" (car (last lines))))))
+          (should (buffer-live-p (get-buffer buffer))))
+      (when (and buffer (get-buffer buffer))
+        (kill-buffer buffer))
+      (delete-directory envoy-org-spool-directory t))))
+
+(ert-deftest envoy-test-dsh-heading-does-not-ask-for-tmux ()
+  "A dsh heading goes to the web host without a session or window."
+  (envoy-test--with-tmux '()
+    (envoy-test--with-org-file
+        "#+TODO: TODO DOING | DONE\n* TODO The task\n"
+      (let ((envoy-tmux-providers
+             '((dsh :program "true" :name "dsh" :args ()
+                    :prompt-arg "@%s" :model-arg "--model"
+                    :effort-arg "--thinking" :efforts ("off" "low" "high" "max")
+                    :variable model :setup nil :models ())))
+            (sent nil))
+        (cl-letf (((symbol-function 'envoy-tmux-read-session)
+                   (lambda (&rest _)
+                     (error "Dsh must not ask for a tmux session")))
+                  ((symbol-function 'envoy-tmux-window)
+                   (lambda (&rest _)
+                     (error "Dsh must not open a tmux window")))
+                  ((symbol-function 'envoy-dsh-send)
+                   (lambda (title _prompt &optional model plan-into claim effort
+                                       on-start)
+                     (setq sent (list title model plan-into
+                                      (and claim t) effort))
+                     (funcall on-start)
+                     "*dsh: The task*"))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (should (equal (envoy-tmux-org-heading-to 'dsh)
+                         "*dsh: The task*"))
+          (should (equal (org-get-todo-state) "DOING"))
+          (should (equal sent '("The task" nil nil t nil))))
+        (should-not (envoy-test--tmux-calls))))))
 
 (ert-deftest envoy-test-tmux-command-effort-validation-and-replacement ()
   "An explicit effort replaces configured flags and rejects invalid input."
@@ -3975,6 +4056,31 @@ for a provider that reads a file and for one that is typed at."
            (make-directory envoy-org-spool-directory t)
            ,@body)
        (delete-directory directory t))))
+
+(ert-deftest envoy-test-dsh-exit-fallback-publishes-for-owned-claim ()
+  "A dsh run that exits without a marker leaves an incomplete report."
+  (envoy-test--with-tmux-spool
+    (let* ((claim (envoy-org--spool-claim "dsh-owned-run" "The task"))
+           (failed (envoy-org--spool-file
+                    (plist-get claim :key) envoy-org--spool-failed-suffix)))
+      (envoy-dsh--write-failed claim)
+      (with-temp-buffer
+        (insert-file-contents failed)
+        (should (equal (buffer-string)
+                       (concat "ENVOY_STATUS: incomplete\n"
+                               "The agent exited without publishing a report.\n")))))))
+
+(ert-deftest envoy-test-dsh-exit-fallback-keeps-an-existing-marker ()
+  "A dsh fallback leaves a report the agent already published alone."
+  (envoy-test--with-tmux-spool
+    (let* ((claim (envoy-org--spool-claim "dsh-done-run" "The task"))
+           (failed (envoy-org--spool-file
+                    (plist-get claim :key) envoy-org--spool-failed-suffix)))
+      (with-temp-file failed (insert "original marker\n"))
+      (envoy-dsh--write-failed claim)
+      (with-temp-buffer
+        (insert-file-contents failed)
+        (should (equal (buffer-string) "original marker\n"))))))
 
 (defun envoy-test--run-tmux-exit-fallback (claim)
   "Run CLAIM's generated fallback after a shell command fails."
@@ -5208,7 +5314,7 @@ The optional notmuch package is not loaded."
        ,@body)))
 
 (ert-deftest envoy-test-notmuch-delegate-dsh-sends-to-dsh ()
-  "The dsh notmuch command hands the request to dsh, not to OMP."
+  "The dsh notmuch command hands the request to dsh without asking for tmux."
   (with-temp-buffer
     (let ((major-mode 'notmuch-show-mode)
           (sent nil))
@@ -5217,19 +5323,24 @@ The optional notmuch package is not loaded."
         (cl-letf (((symbol-function 'envoy--read-direction)
                    (lambda (&rest _) "Look at this"))
                   ((symbol-function 'envoy-tmux-read-session)
-                   (lambda (provider)
-                     (should (eq provider 'dsh))
-                     "work"))
+                   (lambda (&rest _)
+                     (error "Dsh must not ask for a tmux session")))
                   ((symbol-function 'envoy-tmux-window)
-                   (lambda (&rest _) "work:7"))
+                   (lambda (&rest _)
+                     (error "Dsh must not open a tmux window")))
                   ((symbol-function 'envoy-tmux--provider-program)
                    (lambda (&rest _) "/fake/dsh-launch"))
-                  ((symbol-function 'envoy-tmux-send)
-                   (lambda (target _prompt &optional provider &rest _)
-                     (setq sent (list target provider))))
+                  ((symbol-function 'envoy-dsh-send)
+                   (lambda (title prompt &optional model plan-into claim effort
+                                       _on-start)
+                     (setq sent (list title model plan-into claim effort))
+                     (should (string-prefix-p
+                              "DIRECTION FROM THE USER\nLook at this\n\n"
+                              prompt))
+                     "*dsh: message*"))
                   ((symbol-function 'message) (lambda (&rest _) nil)))
-          (should (equal (envoy-notmuch-delegate-dsh) "work:7"))
-          (should (equal sent '("work:7" dsh))))))))
+          (should (equal (envoy-notmuch-delegate-dsh) "*dsh: message*"))
+          (should (equal sent '("id:message-dsh" nil nil nil nil))))))))
 
 (ert-deftest envoy-test-notmuch-region-precedes-thread-and-prompt-effects ()
   "The selected region stays primary after instruction input moves point.
@@ -6690,6 +6801,33 @@ Text visible in a filtered show buffer is not treated as the thread."
         (should (equal (nth 4 sent) "careful"))
         (should (string-prefix-p
                  "USER DIRECTION\nInspect the Org file\n\n" (nth 1 sent)))))))
+
+(ert-deftest envoy-test-dired-dsh-does-not-ask-for-a-session ()
+  "A Dired dispatch to dsh goes straight to the web host."
+  (envoy-test--with-dired-files '("task.org")
+    (let* ((path (expand-file-name "task.org" default-directory))
+           (envoy-tmux-providers
+            '((dsh :program "true" :name "dsh" :variable model)))
+           (sent nil))
+      (dired-goto-file path)
+      (cl-letf (((symbol-function 'envoy--read-direction)
+                 (lambda (&rest _) "Inspect the Org file"))
+                ((symbol-function 'envoy-tmux-read-session)
+                 (lambda (&rest _)
+                   (error "Dsh must not ask for a tmux session")))
+                ((symbol-function 'envoy-tmux-window)
+                 (lambda (&rest _)
+                   (error "Dsh must not open a tmux window")))
+                ((symbol-function 'envoy-dsh-send)
+                 (lambda (title prompt &optional model plan-into claim effort
+                                     _on-start)
+                   (setq sent (list title model plan-into claim effort))
+                   (should (string-prefix-p
+                            "USER DIRECTION\nInspect the Org file\n\n" prompt))
+                   "*dsh: task.org*"))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (should (equal (envoy-dired-dsh) "*dsh: task.org*"))
+        (should (equal sent '("task.org" nil nil nil nil)))))))
 
 (ert-deftest envoy-test-dired-marked-files-are-all-named-in-brief ()
   "Every marked Dired file appears in the brief as an absolute JSON string."
