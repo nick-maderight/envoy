@@ -63,6 +63,29 @@ The dsh prefix picker offers `deepseek-flash` and `deepseek-v4-pro`, then the ef
 
 dsh sessions live in the dsh web host that `dsh-web.service` runs on this machine. `C-c C-x S` opens a tmux window that runs `dsh-launch`. dsh-launch starts the session in the host and prints `working`, `waiting for input` or `idle` whenever the state changes. The last line names how the final turn ended. Answer questions and plan reviews in triage or in the dsh web UI, which `dsh-launch open` brings up. Plan into lets dsh plan first and hands the approved plan to the execution model. The report contract and the incomplete `.failed` fallback work the same way they do for OMP.
 
+## dsh without a terminal
+
+dsh is also an agent `envoy-rewrite` and `envoy-org-heading` can run as a subprocess. `M-x envoy-select-provider` switches to it for the session. Setting `envoy-provider` to `dsh` in your init makes the choice stick. The heading shortcut for the subprocess transport is `C-c C-x A`, which sends a heading to dsh in a background run instead of a tmux window.
+
+The provider runs `dsh --profile headless --json` and gives the brief on standard input. Envoy reads the run's closing event for the answer, the session id and how the turn ended. Only a zero exit with a `completed` turn counts as success. Two options travel on every command line. `--approval-policy never` keeps an unattended run from stopping at an approval card nobody will answer. For a run that may edit, `--permission-mode workspace-write` replaces the read-only mode. Writes then stay under the directory the run starts in.
+
+That directory is the file's project for a rewrite. For a heading dispatch it is the heading's attachment directory, which is where the brief already sends the outputs.
+
+A headless run takes its model from its profile. The entry offers no `:model-arg`, which leaves `envoy-model` with nowhere to go. The run also needs the DeepSeek key in its environment, which an Emacs usually does not hold. `:environment` supplies the key from a command whose output becomes a variable for the run:
+
+```elisp
+(with-eval-after-load 'envoy-process
+  (setq envoy-providers
+        (mapcar (lambda (entry) (cons (car entry) (copy-sequence (cdr entry))))
+                envoy-providers))
+  (setf (plist-get (alist-get 'dsh envoy-providers) :environment)
+        '(("DEEPSEEK_API_KEY" . "my-key-command"))))
+```
+
+The command runs when a dispatch starts, which sends a rotated key to the next run without a restart. A command that fails or prints nothing stops the run before the agent starts. The message names the variable and leaves the value out.
+
+dsh has no option that takes a tool away. `envoy-can-deny-tools-p` is nil for it. `envoy-rewrite` then asks before it starts, the same as reasonix. To stop a rewrite running shell commands, turn off `tool-bash` in the headless profile.
+
 ## In orgmode, the heading gets the answer
 
 Both subprocess and terminal reports must start with exactly one line, either `ENVOY_STATUS: complete` or `ENVOY_STATUS: incomplete`. Envoy strips this line before filing the report. A successful process exit or `.done` spool file alone does not complete the heading. Only successful delivery with an explicit `complete` status for the whole subtree moves it to the configured done keyword. Missing, invalid, or `incomplete` status leaves the heading at its configured active keyword, normally `DOING`. When that setting is nil, Envoy preserves the current keyword.
@@ -76,7 +99,9 @@ Envoy links only existing new attachment files named in the report and identifie
 
 ## Install
 
-Envoy requires Emacs 27.1 or newer and at least one agent program on `exec-path`. The terminal commands also require tmux. The dsh commands require `dsh-launch` on `exec-path` and a running `dsh-web.service`. `envoy-notmuch-delegate` requires OMP and `envoy-notmuch-delegate-dsh` requires dsh. Both also require the notmuch Emacs package.
+Envoy requires Emacs 27.1 or newer and at least one agent program on `exec-path`. The terminal commands also require tmux. The dsh terminal commands require `dsh-launch` on `exec-path` and a running `dsh-web.service`. `envoy-notmuch-delegate` requires OMP and `envoy-notmuch-delegate-dsh` requires dsh. Both also require the notmuch Emacs package.
+
+The dsh subprocess provider needs `dsh` on `exec-path` and a profile named `headless` under `DSH_HOME`, which `dsh --from-default-profile headless` creates. Its run needs the key in its environment; see "dsh without a terminal" above.
 
 Envoy finds each program with `executable-find`. A GUI Emacs or a daemon may start without your login shell's `PATH`, so a program that runs in a terminal can still be missing here. Please import your shell's `PATH` into `exec-path` at startup instead of writing absolute paths into `envoy-providers`.
 
@@ -166,7 +191,7 @@ The `mapcar` copy gives your settings their own plists instead of editing the qu
 
 | Setting | Meaning |
 |----|----|
-| `envoy-provider` | which agent, `'claude` or `'reasonix` |
+| `envoy-provider` | which agent, a key of `envoy-providers`: `'claude`, `'reasonix` or `'dsh` |
 | `envoy-model` | a model to ask for, or nil for the agent's own |
 | `envoy-deny-tools` | tools to deny, `'("Bash")` by default |
 | `envoy-timeout` | seconds before a run is given up on, 600 |
@@ -217,6 +242,8 @@ An agent that runs non-interactively and prints a JSON result joins `envoy-provi
 ```
 
 The envelope requires `result` for the agent's closing message and `is_error` for whether it failed. `session_id`, `total_cost_usd` and `num_turns` are used when present. Set `:deny-arg` to nil for an agent with no such option, and Envoy warns instead of pretending.
+
+An agent that reports some other way names its shape with `:format`. `json` is the envelope above and the default. `dsh` reads the closing event of a dsh headless run, where `reason` says how the turn ended. An agent that needs a credential Emacs does not hold names it in `:environment`, as a list of pairs holding a variable name and a command whose trimmed output becomes its value for that run.
 
 A tmux agent joins `envoy-tmux-providers` by saying how the brief reaches it. `:prompt-arg` is a format string that gets the file holding the brief. `"@%s"` suits an agent that reads a file named on its command line, `"\"$(cat %s)\""` suits one that takes the prompt as an argument, and nil means Envoy types the brief into the terminal after the agent starts. `:opening-input` lists lines to type before the brief for an agent that only takes a setting through its own interface, and it requires `:prompt-arg` to be nil.
 

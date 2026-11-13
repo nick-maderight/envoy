@@ -47,6 +47,12 @@
 ;; parseable on standard output is a third state, produced by a rejected
 ;; command line, and it is a failure too.
 ;;
+;; dsh keeps its own account.  A headless run writes one JSON event per
+;; line, and the closing event carries the answer and how the turn ended.
+;; A provider names that shape with `:format', and it is read by its own
+;; branch rather than bent into the envelope above, since the field names
+;; and the notion of success are its own.
+;;
 ;; One fact about Emacs shapes the rest.  A process sentinel is not
 ;; something Emacs can be relied on to deliver: an open bug (debbugs
 ;; #63078, #68792) drops it when a child exits very soon after writing
@@ -93,7 +99,30 @@ One of the keys of `envoy-providers'."
      :edit-args ()
      :deny-arg nil
      :deny-separate nil
-     :model-arg "--model"))
+     :model-arg "--model")
+    (dsh
+     :program "dsh"
+     :name "dsh"
+     ;; The task arrives on standard input, which `-` as the only positional
+     ;; asks for.  `--json` is what makes a run report how it ended;
+     ;; without it the final message is all that comes back.  `never` is not
+     ;; a preference: nobody is at this run's terminal to answer an approval
+     ;; card, so a run that asks one would sit there until it timed out.
+     :args ("--profile" "headless" "--json" "--approval-policy" "never"
+            "--permission-mode" "read-only" "-")
+     ;; Written after `:args` on purpose.  A repeated option is a
+     ;; replacement in commander, so this is the mode in force for a run
+     ;; that may edit, and the read-only mode above is what a run that may
+     ;; not gets.  A dsh rewrite writes only under the directory it runs in,
+     ;; because that directory is the sandbox root a headless run grants.
+     :edit-args ("--permission-mode" "workspace-write")
+     :deny-arg nil
+     :deny-separate nil
+     ;; A headless run takes its model from its profile; there is no option
+     ;; to pass one on the command line.
+     :model-arg nil
+     :format dsh
+     :environment ()))
   "Coding agents envoy knows how to run.
 Each entry is (SYMBOL . PLIST).  The properties are:
 
@@ -106,6 +135,16 @@ Each entry is (SYMBOL . PLIST).  The properties are:
              non-nil when :deny-arg takes each tool as its own argument
              rather than one comma-separated argument
 :model-arg   option that selects a model
+:format      how the agent reports the run: `json' for the result envelope
+             Claude Code and reasonix print, `dsh' for the closing event of
+             a dsh headless run.  Defaults to `json'
+:environment
+             an alist of (VARIABLE . COMMAND).  COMMAND is run in a shell
+             before the agent starts and its trimmed output becomes
+             VARIABLE in the agent's environment, which is otherwise this
+             Emacs's own.  A credential Emacs does not hold goes here.  A
+             command that fails or prints nothing stops the run, and the
+             value is never put in a message
 
 An agent whose :deny-arg is nil cannot be stopped from running shell
 commands.  See `envoy-deny-tools'."
@@ -187,6 +226,36 @@ files, and the arguments that deny `envoy-deny-tools'."
   "Return non-nil when PROVIDER can be told not to use a tool."
   (and (plist-get (envoy--provider provider) :deny-arg) t))
 
+(defun envoy--environment (plist)
+  "Return the extra environment entries PLIST asks for.
+Each is a pair of a variable name and a shell command.  The command is
+run now and its trimmed output becomes the variable's value for the
+agent, keyed the way `process-environment' wants it.  A command that
+fails or prints nothing is a `user-error' naming the variable and not
+its value, because a run that starts without a credential it needs only
+fails later, inside the agent, where the reason is much harder to see."
+  (let (entries)
+    (dolist (spec (plist-get plist :environment))
+      (let ((variable (car spec))
+            (command (cdr spec))
+            value)
+        (unless (and (stringp variable)
+                     (string-match-p "\\`[A-Za-z_][A-Za-z0-9_]*\\'" variable))
+          (user-error "Envoy: %S is not an environment variable name" variable))
+        (setq value
+              (with-temp-buffer
+                (let ((status (call-process-shell-command command nil t)))
+                  (unless (and (integerp status) (zerop status))
+                    (user-error
+                     "Envoy: the command providing %s failed (%s)"
+                     variable status))
+                  (string-trim (buffer-string)))))
+        (when (string-empty-p value)
+          (user-error "Envoy: the command providing %s printed nothing"
+                      variable))
+        (push (concat variable "=" value) entries)))
+    (nreverse entries)))
+
 (defun envoy--parse-json (string)
   "Parse STRING as JSON into an alist, or return nil.
 Absent values come back as nil rather than as a sentinel, so a caller
@@ -251,9 +320,69 @@ STDERR    everything the agent wrote to standard error
 STDOUT    everything it wrote to standard output"
   ok text status session cost turns stderr stdout)
 
-(defun envoy--result-from (status stdout stderr)
+(defun envoy--dsh-final-p (event)
+  "Return non-nil when EVENT is the closing event of a dsh run."
+  (and (listp event)
+       (cl-every (lambda (entry)
+                   (and (consp entry) (symbolp (car entry))))
+                 event)
+       (equal (cdr (assq 'type event)) "final")
+       (stringp (cdr (assq 'text event)))))
+
+(defun envoy--parse-dsh-final (stdout)
+  "Return the closing `final' event in STDOUT as an alist, or nil.
+A dsh headless run writes one JSON event per line and ends with that
+event.  Tool results and reasoning fill the lines before it, so only a
+line that is itself the closing event is taken, and the last one wins."
+  (let ((lines (nreverse (split-string stdout "\n" t)))
+        (found nil))
+    (while (and lines (not found))
+      (let ((event (envoy--parse-json (string-trim (pop lines)))))
+        (when (envoy--dsh-final-p event)
+          (setq found event))))
+    found))
+
+(defun envoy--dsh-result-from (status stdout stderr)
+  "Interpret a finished dsh headless run and return an `envoy-result'.
+STATUS is the process exit status, STDOUT and STDERR its two streams.
+
+A run is good only when it exited 0 and its closing event says the turn
+ended `completed'.  Every other ending carries a reason: `error' holds
+the agent's own error there, and the rest say only what happened, so the
+closing message stands in for them.  A run with no closing event never
+got far enough to have one, and the last thing it said on standard error
+is the only account of why."
+  (let* ((event (envoy--parse-dsh-final stdout))
+         (text (cdr (assq 'text event)))
+         (reason (cdr (assq 'reason event)))
+         (kind (cdr (assq 'kind (and (listp reason) reason))))
+         (failure (cdr (assq 'error (and (listp reason) reason))))
+         (message (cdr (assq 'message (and (listp failure) failure)))))
+    (cond
+     ((null event)
+      (envoy--make-result
+       :ok nil :status status :stdout stdout :stderr stderr
+       :text (if (string-empty-p (string-trim stderr))
+                 (format "The agent exited with status %s and said nothing" status)
+               (car (last (split-string (string-trim stderr) "\n" t))))))
+     ((and (zerop status) (equal kind "completed"))
+      (envoy--make-result
+       :ok t :status status :stdout stdout :stderr stderr
+       :text (or text "")
+       :session (cdr (assq 'sessionId event))))
+     (t
+      (envoy--make-result
+       :ok nil :status status :stdout stdout :stderr stderr
+       :text (or (and (stringp text) (not (string-empty-p text)) text)
+                 message
+                 (format "The agent exited with status %s%s" status
+                         (if kind (format " (%s)" kind) "")))
+       :session (cdr (assq 'sessionId event)))))))
+
+(defun envoy--result-from (status stdout stderr &optional format)
   "Interpret a finished run and return an `envoy-result'.
 STATUS is the process exit status, STDOUT and STDERR its two streams.
+FORMAT is the provider's `:format', defaulting to `json'.
 
 Failure is read from STATUS and from the envelope's `is_error', never
 from its `subtype': Claude Code reports subtype \"success\" alongside
@@ -263,29 +392,35 @@ call a failed run good.  Both agents put something a person can read in
 
 Exit 0 with no envelope is its own failure, and the one a rejected
 command line produces: the agent prints its usage to standard error and
-leaves standard output empty."
-  (let* ((envelope (envoy--parse-envelope stdout))
-         (text (cdr (assq 'result envelope)))
-         (errored (cdr (assq 'is_error envelope))))
-    (cond
-     ((null envelope)
-      (envoy--make-result
-       :ok nil :status status :stdout stdout :stderr stderr
-       :text (if (string-empty-p (string-trim stderr))
-                 (format "The agent exited with status %s and said nothing" status)
-               (car (last (split-string (string-trim stderr) "\n" t))))))
-     ((or (not (zerop status)) errored)
-      (envoy--make-result
-       :ok nil :status status :stdout stdout :stderr stderr
-       :text (or text (format "The agent exited with status %s" status))
-       :session (cdr (assq 'session_id envelope))))
-     (t
-      (envoy--make-result
-       :ok t :status status :stdout stdout :stderr stderr
-       :text (or text "")
-       :session (cdr (assq 'session_id envelope))
-       :cost (cdr (assq 'total_cost_usd envelope))
-       :turns (cdr (assq 'num_turns envelope)))))))
+leaves standard output empty.
+
+A `dsh' run reports in newline-delimited events instead, and its own
+reader maps the closing one onto the same fields; see
+`envoy--dsh-result-from'."
+  (if (eq format 'dsh)
+      (envoy--dsh-result-from status stdout stderr)
+    (let* ((envelope (envoy--parse-envelope stdout))
+           (text (cdr (assq 'result envelope)))
+           (errored (cdr (assq 'is_error envelope))))
+      (cond
+       ((null envelope)
+        (envoy--make-result
+         :ok nil :status status :stdout stdout :stderr stderr
+         :text (if (string-empty-p (string-trim stderr))
+                   (format "The agent exited with status %s and said nothing" status)
+                 (car (last (split-string (string-trim stderr) "\n" t))))))
+       ((or (not (zerop status)) errored)
+        (envoy--make-result
+         :ok nil :status status :stdout stdout :stderr stderr
+         :text (or text (format "The agent exited with status %s" status))
+         :session (cdr (assq 'session_id envelope))))
+       (t
+        (envoy--make-result
+         :ok t :status status :stdout stdout :stderr stderr
+         :text (or text "")
+         :session (cdr (assq 'session_id envelope))
+         :cost (cdr (assq 'total_cost_usd envelope))
+         :turns (cdr (assq 'num_turns envelope))))))))
 
 (defun envoy--check-brief (brief)
   "Refuse a dispatch whose brief BRIEF carries no task, by signaling a user error.
@@ -318,7 +453,8 @@ KEYS are keyword arguments:
   (let* ((provider (plist-get keys :provider))
          (directory (or (plist-get keys :directory) default-directory))
          (timeout (or (plist-get keys :timeout) envoy-timeout))
-         stdout stderr-buffer stderr process timer watchdog finish cleanup command)
+         stdout stderr-buffer stderr process timer watchdog finish cleanup
+         command environment)
     (setq cleanup
           (lambda ()
             (when process
@@ -357,10 +493,13 @@ KEYS are keyword arguments:
                                         (format "Gave up after %s seconds"
                                                 timeout)
                                       "Cancelled"))
-                           (envoy--result-from status out err)))))))
+                           (envoy--result-from
+                            status out err
+                            (plist-get (envoy--provider provider) :format))))))))
     (condition-case error
         (progn
           (setq command (envoy--command provider (plist-get keys :edit)))
+          (setq environment (envoy--environment (envoy--provider provider)))
           (setq stdout (generate-new-buffer " *envoy-stdout*"))
           (setq stderr-buffer (generate-new-buffer " *envoy-stderr*"))
           ;; A pipe process of its own for standard error.  Without it the
@@ -374,8 +513,12 @@ KEYS are keyword arguments:
                 ;; The agent inherits this directory, and it is the whole of
                 ;; what the agent treats as the project: which files it can
                 ;; find, and which configuration it reads, both follow from
-                ;; it.
-                (let ((default-directory directory))
+                ;; it.  The environment is this Emacs's own, with whatever
+                ;; the provider asked for put in front of it so its entries
+                ;; win over an inherited value of the same name.
+                (let ((default-directory directory)
+                      (process-environment (append environment
+                                                   process-environment)))
                   (make-process
                    :name "envoy"
                    :buffer stdout

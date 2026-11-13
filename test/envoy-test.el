@@ -265,6 +265,189 @@ one, so both branches have to agree."
   (should-not (envoy--parse-json "not json at all"))
   (should-not (envoy--parse-json "")))
 
+;;; A dsh headless run
+
+(ert-deftest envoy-test-dsh-provider-asks-for-a-headless-run ()
+  "The shipped dsh entry runs one headless task that cannot stop to ask.
+A run with nobody at its terminal must never raise an approval card,
+which is why the policy travels on every command line rather than being
+left to a profile.  The mode that matters is written last: commander
+replaces a repeated option, so the read-only mode is what a caller that
+may not edit gets, and the editable mode comes after it."
+  (let ((envoy-model "a-model-nobody-can-pass"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (program)
+                 (and (equal program "dsh") "/usr/bin/dsh"))))
+      (let ((line (envoy--command 'dsh nil)))
+        (should (equal (car line) "/usr/bin/dsh"))
+        (should (equal (cl-subseq line 1 3) '("--profile" "headless")))
+        (should (member "--json" line))
+        (should (equal (cadr (member "--approval-policy" line)) "never"))
+        (should (member "read-only" line))
+        (should-not (member "workspace-write" line))
+        ;; The task arrives on standard input.
+        (should (equal (car (last line)) "-"))
+        ;; A headless run takes its model from its profile, and a model
+        ;; option here would be rejected rather than honoured.
+        (should-not (member "--model" line))
+        (should-not (member envoy-model line)))
+      (let ((line (envoy--command 'dsh t)))
+        (should (member "workspace-write" line))
+        (should (cl-position "read-only" line :test #'equal))
+        (should (< (cl-position "read-only" line :test #'equal)
+                   (cl-position "workspace-write" line :test #'equal)))))
+    ;; It is a provider like any other, and a rewrite through it says so.
+    (should (assq 'dsh envoy-providers))
+    (should-not (envoy-can-deny-tools-p 'dsh))))
+
+(ert-deftest envoy-test-dsh-final-event-is-read ()
+  "The closing event of a dsh run is read for its text, session and ending.
+The lines before it carry status, reasoning and tool results, so a
+reader that took the first JSON line would take a status for an answer."
+  (let ((result (envoy--result-from
+                 0 (concat "{\"type\":\"status\",\"phase\":\"turn_start\",\"turn\":1}\n"
+                           "{\"type\":\"tool_call\",\"callId\":\"c1\",\"tool\":\"edit\"}\n"
+                           "{\"type\":\"final\",\"sessionId\":\"session-1\",\
+\"reason\":{\"kind\":\"completed\"},\"text\":\"Rewrote the paragraph.\"}\n")
+                 "" 'dsh)))
+    (should (envoy-result-ok result))
+    (should (equal (envoy-result-text result) "Rewrote the paragraph."))
+    (should (equal (envoy-result-session result) "session-1"))))
+
+(ert-deftest envoy-test-dsh-unfinished-turn-is-a-failure ()
+  "A run whose turn did not end `completed' is a failure with its reason.
+dsh reports a provider error inside the closing event's reason, and that
+message is the only account of what went wrong."
+  (let ((result (envoy--result-from
+                 1 "{\"type\":\"final\",\"sessionId\":\"session-2\",\
+\"reason\":{\"kind\":\"error\",\"error\":{\"code\":\"AUTH\",\
+\"message\":\"the key was refused\"}},\"text\":\"\"}"
+                 "dsh: AUTH: the key was refused\n" 'dsh)))
+    (should-not (envoy-result-ok result))
+    (should (equal (envoy-result-text result) "the key was refused"))))
+
+(ert-deftest envoy-test-dsh-stop-reason-without-a-message-still-fails ()
+  "A run that stopped for a reason dsh names only is still a failure.
+`interrupted' and `aborted' carry no message, so the ending itself is
+what the person reading the echo area has to be told."
+  (let ((result (envoy--result-from
+                 1 "{\"type\":\"final\",\"sessionId\":\"s\",\
+\"reason\":{\"kind\":\"interrupted\"},\"text\":\"partial answer\"}" "" 'dsh)))
+    (should-not (envoy-result-ok result))
+    (should (equal (envoy-result-text result) "partial answer")))
+  (let ((result (envoy--result-from
+                 1 "{\"type\":\"final\",\"sessionId\":\"s\",\
+\"reason\":{\"kind\":\"interrupted\"},\"text\":\"\"}" "" 'dsh)))
+    (should-not (envoy-result-ok result))
+    (should (string-match-p "interrupted" (envoy-result-text result)))))
+
+(ert-deftest envoy-test-dsh-run-with-no-final-event-is-a-failure ()
+  "A run that never got far enough to report is read from standard error.
+A rejected command line is exactly this shape: the usage text on
+standard error, nothing on standard output, and an exit status."
+  (let ((result (envoy--result-from 2 "" "error: a task is required\n" 'dsh)))
+    (should-not (envoy-result-ok result))
+    (should (equal (envoy-result-text result) "error: a task is required")))
+  (let ((result (envoy--result-from 0 "" "" 'dsh)))
+    (should-not (envoy-result-ok result))
+    (should (string-match-p "status 0" (envoy-result-text result)))))
+
+(ert-deftest envoy-test-dsh-completed-reason-cannot-outvote-the-status ()
+  "Exit status and the closing reason must both say the run finished.
+A crash after the turn closed leaves a `completed' event behind."
+  (let ((result (envoy--result-from
+                 1 "{\"type\":\"final\",\"sessionId\":\"s\",\
+\"reason\":{\"kind\":\"completed\"},\"text\":\"answered\"}" "" 'dsh)))
+    (should-not (envoy-result-ok result))))
+
+(ert-deftest envoy-test-provider-environment-is-read-from-a-command ()
+  "A provider's environment entries come from its own commands.
+This is where a credential Emacs does not hold comes from, so the value
+is taken from the command's output and trimmed."
+  (should (equal (envoy--environment
+                  '(:environment (("ENVOY_TEST_ONE" . "printf ' value '"))))
+                 '("ENVOY_TEST_ONE=value")))
+  (should (equal (envoy--environment
+                  '(:environment (("A" . "printf %s one")
+                                  ("B" . "printf 'two=with=equals'"))))
+                 '("A=one" "B=two=with=equals")))
+  (should-not (envoy--environment '(:environment nil)))
+  (should-not (envoy--environment '())))
+
+(ert-deftest envoy-test-provider-environment-failure-names-the-variable ()
+  "A credential command that fails or prints nothing stops the run.
+Starting anyway would fail later inside the agent, where the reason is
+much harder to see.  The message names the variable and never a value."
+  (dolist (spec '(("ENVOY_TEST_FAILED" . "exit 3")
+                  ("ENVOY_TEST_EMPTY" . "true")))
+    (let ((message (cadr (should-error (envoy--environment
+                                        (list :environment (list spec)))
+                                       :type 'user-error))))
+      (should (string-match-p (car spec) message))
+      (should-not (string-match-p "=.*" message)))))
+
+(ert-deftest envoy-test-bad-environment-name-is-refused ()
+  "An entry whose name is not a variable name is refused before it runs."
+  (let ((ran nil))
+    (cl-letf (((symbol-function 'call-process-shell-command)
+               (lambda (&rest _) (setq ran t) 0)))
+      (should-error (envoy--environment '(:environment (("bad name" . "true"))))
+                    :type 'user-error)
+      (should-not ran))))
+
+(ert-deftest envoy-test-dsh-run-end-to-end ()
+  "A dsh-shaped run reaches the caller through the dsh reader.
+The stand-in prints a status line before its closing event, the way a
+real run does, and reports the credential it was handed."
+  (let* ((script (make-temp-file "envoy-test-dsh-" nil ".sh"))
+         (envoy-providers (list (list 'test
+                                      :program script
+                                      :name "test dsh"
+                                      :args '("-")
+                                      :edit-args nil
+                                      :deny-arg nil
+                                      :model-arg nil
+                                      :format 'dsh
+                                      :environment
+                                      '(("ENVOY_TEST_DEEPSEEK_KEY"
+                                         . "printf %s secret-from-a-command")))))
+         (envoy-provider 'test)
+         (envoy-model nil))
+    (with-temp-file script
+      (insert "#!/bin/sh\n"
+              "cat >/dev/null\n"
+              "printf '%s\\n' '{\"type\":\"status\",\"phase\":\"turn_start\",\"turn\":1}'\n"
+              "printf '{\"type\":\"final\",\"sessionId\":\"session-e2e\",\
+\"reason\":{\"kind\":\"completed\"},\"text\":\"%s\"}\\n' \
+\"${ENVOY_TEST_DEEPSEEK_KEY:-missing}\"\n"))
+    (set-file-modes script #o755)
+    (unwind-protect
+        (let ((result (envoy-test--run "do something")))
+          (should (envoy-result-ok result))
+          (should (equal (envoy-result-text result) "secret-from-a-command"))
+          (should (equal (envoy-result-session result) "session-e2e")))
+      (ignore-errors (delete-file script)))))
+
+(ert-deftest envoy-test-environment-failure-starts-nothing ()
+  "A run whose credential command failed never starts an agent.
+The provider here would otherwise start, so the refusal has to happen
+before the process exists rather than being reported afterwards."
+  (let ((envoy-providers (list (list 'test
+                                     :program "/bin/true"
+                                     :name "test"
+                                     :args nil
+                                     :edit-args nil
+                                     :deny-arg nil
+                                     :model-arg nil
+                                     :environment
+                                     '(("ENVOY_TEST_MISSING" . "exit 4")))))
+        (envoy-provider 'test)
+        started)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest _) (setq started t))))
+      (should-error (envoy-run "do something" #'ignore) :type 'user-error))
+    (should-not started)))
+
 ;;; Running a process
 
 (ert-deftest envoy-test-run-separates-the-two-streams ()
