@@ -4102,14 +4102,17 @@ for a provider that reads a file and for one that is typed at."
           (calls nil)
           file command)
       (unwind-protect
-          (progn
-            (cl-letf (((symbol-function 'envoy-tmux--call)
-                       (lambda (&rest args)
-                         (if (equal (car args) "display-message")
-                             '(0 . "sh")
-                           (push args calls)
-                           '(0 . "")))))
-              (setq file (envoy-tmux-send "session:7" "Do the task." 'omp)))
+          ;; The assertions run under the same stand-in that produced the
+          ;; command.  The expected cleanup suffix asks tmux what shell the
+          ;; pane runs, and a machine without tmux would answer nothing
+          ;; here even though the dispatch itself never needed it.
+          (cl-letf (((symbol-function 'envoy-tmux--call)
+                     (lambda (&rest args)
+                       (if (equal (car args) "display-message")
+                           '(0 . "sh")
+                         (push args calls)
+                         '(0 . "")))))
+            (setq file (envoy-tmux-send "session:7" "Do the task." 'omp))
             (let ((launch (seq-find
                            (lambda (call)
                              (and (equal (car call) "send-keys")
