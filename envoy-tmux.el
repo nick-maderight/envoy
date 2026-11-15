@@ -161,10 +161,12 @@ One of the keys of `envoy-tmux-providers'."
      :system-arg "--append-system-prompt=%s"
      :model-arg "--model"
      :effort-arg "--thinking"
-     :efforts ("off" "low" "high" "max")
+     ;; The chains offer low, high and max. The bridge rejects off for them.
+     :efforts ("low" "high" "max")
      :variable model
      :setup nil
-     :models ("deepseek-flash" "deepseek-v4-pro")))
+     ;; The host's fallback chains. A bare deepseek-flash resolves to native DeepSeek.
+     :models ("FallbacksChain/Auto" "FallbacksChain/AutoCC")))
   "Agents envoy knows how to start, in a tmux window or in dsh's web host.
 Each entry is (SYMBOL . PLIST).  The properties are:
 
