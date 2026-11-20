@@ -5472,10 +5472,52 @@ reference the agent must not act on."
                      "Do not act on"
                      (substring prompt support-start thread-start)))))))))
 
+(defmacro envoy-test--with-notmuch-list (entries &rest body)
+  "Evaluate BODY with a notmuch search buffer built from ENTRIES.
+Each entry is (THREAD SUBJECT TEXT), one result line per entry, and each
+\"show\" call returns that thread's TEXT.  The optional notmuch package is not
+loaded."
+  (declare (indent 1) (debug t))
+  `(let ((notmuch-calls nil)
+         (real-require (symbol-function 'require)))
+     (with-temp-buffer
+       (dolist (entry ,entries)
+         (let ((start (point)))
+           (insert (nth 1 entry) "\n")
+           (put-text-property start (point)
+                              'notmuch-search-result
+                              (list :thread (nth 0 entry)
+                                    :subject (nth 1 entry)))))
+       (goto-char (point-min))
+       (let ((major-mode 'notmuch-search-mode))
+         (cl-letf (((symbol-function 'require)
+                    (lambda (feature &optional filename noerror)
+                      (if (eq feature 'notmuch)
+                          t
+                        (funcall real-require feature filename noerror))))
+                   ((symbol-function 'notmuch-search-get-result)
+                    (lambda (&optional pos)
+                      (get-text-property (or pos (point))
+                                         'notmuch-search-result)))
+                   ((symbol-function 'notmuch-command-to-string)
+                    (lambda (&rest args)
+                      (push args notmuch-calls)
+                      (let ((query (car (last args))))
+                        (if (not (equal (car args) "show"))
+                            (error "Unexpected notmuch arguments %S" args)
+                          (or (cl-some
+                               (lambda (entry)
+                                 (when (equal query
+                                              (concat "thread:" (nth 0 entry)))
+                                   (nth 2 entry)))
+                               ,entries)
+                              (error "Unexpected thread query %S" query)))))))
+           ,@body)))))
+
 (ert-deftest envoy-test-notmuch-brief-routes-authorization-gates-through-ask ()
   "A mail brief tells the agent to ask for approval instead of parking a change."
   (let ((prompt (envoy-notmuch--prompt
-                 "Improve this" "id:m" "thread:t" "Body" "Body" nil)))
+                 "Improve this" "id:m" '(("thread:t" . "Body")) nil)))
     (should (string-match-p "^APPROVALS$" prompt))
     (should (string-match-p "`ask` tool" prompt))
     (should (string-match-p "Never write a separate handoff" prompt))
@@ -5536,8 +5578,8 @@ Text visible in a filtered show buffer is not treated as the thread."
             notmuch-calls)))))))
 
 (ert-deftest envoy-test-notmuch-preflight-rejects-mode-and-identity ()
-  "A list/tree buffer and a show buffer without message identity do no work."
-  (dolist (mode '(notmuch-tree-mode notmuch-search-mode fundamental-mode))
+  "A tree buffer, and a buffer without a target, do no work."
+  (dolist (mode '(notmuch-tree-mode fundamental-mode))
     (with-temp-buffer
       (let ((major-mode mode)
             (window-called nil)
@@ -5573,6 +5615,145 @@ Text visible in a filtered show buffer is not treated as the thread."
                  (lambda (&rest _) (setq send-called t)))
                 ((symbol-function 'notmuch-command-to-string)
                  (lambda (&rest _) (setq cli-called t)))
+                ((symbol-function 'envoy--read-direction)
+                 (lambda (&rest _) (error "Instruction must not be read"))))
+        (should-error (envoy-notmuch-delegate) :type 'user-error))
+      (should-not window-called)
+      (should-not send-called)
+      (should-not cli-called))))
+
+(ert-deftest envoy-test-notmuch-search-delegates-thread-at-point ()
+  "The thread on the list page's current line goes to OMP as the whole task."
+  (envoy-test--with-notmuch-list
+      '(("thread-list-1" "Invoice question" "LIST THREAD ONE\n"))
+    (let (sent)
+      (cl-letf (((symbol-function 'envoy-tmux--omp-program)
+                 (lambda () "/fake/omp"))
+                ((symbol-function 'envoy--read-direction)
+                 (lambda (&rest _) "Reply to this"))
+                ((symbol-function 'envoy-tmux-read-session)
+                 (lambda (provider)
+                   (should (eq provider 'omp))
+                   "work"))
+                ((symbol-function 'envoy-tmux-window)
+                 (lambda (session title)
+                   (should (equal session "work"))
+                   (should (equal title "Invoice question"))
+                   "work:7"))
+                ((symbol-function 'envoy-tmux-send)
+                 (lambda (target prompt &optional provider model setup
+                                  plan-into &rest _)
+                   (setq sent (list target prompt provider model setup
+                                   plan-into))))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (should (equal (envoy-notmuch-delegate) "work:7"))
+        (should (equal (car sent) "work:7"))
+        (let ((prompt (nth 1 sent)))
+          (should (string-match-p (regexp-quote "LIST THREAD ONE") prompt))
+          (should (string-match-p
+                   "Primary thread query: thread:thread-list-1" prompt))
+          (should-not (string-match-p "Primary message query" prompt))
+          (should-not (string-match-p "PRIMARY SELECTION" prompt))
+          (should (string-match-p
+                   (regexp-quote "not thread:thread-list-1") prompt)))
+        (should
+         (equal notmuch-calls
+                '(("show" "--format=text" "--entire-thread=true"
+                   "--exclude=false" "--" "thread:thread-list-1"))))))))
+
+(ert-deftest envoy-test-notmuch-search-region-delegates-every-covered-thread ()
+  "A region on the list page takes every thread whose line it covers."
+  (envoy-test--with-notmuch-list
+      '(("thread-a" "First subject" "THREAD A TEXT\n")
+        ("thread-b" "Second subject" "THREAD B TEXT\n"))
+    (let ((transient-mark-mode t))
+      (set-mark (save-excursion (goto-char (point-min))
+                                (forward-line 2)
+                                (point)))
+      (activate-mark)
+      (let (sent)
+        (cl-letf (((symbol-function 'envoy-tmux--omp-program)
+                   (lambda () "/fake/omp"))
+                  ((symbol-function 'envoy--read-direction)
+                   (lambda (&rest _)
+                     (deactivate-mark)
+                     "Compare these two"))
+                  ((symbol-function 'envoy-tmux-read-session)
+                   (lambda (&rest _) "work"))
+                  ((symbol-function 'envoy-tmux-window)
+                   (lambda (session title)
+                     (should (equal session "work"))
+                     (should (equal title "First subject (+1 more)"))
+                     "work:7"))
+                  ((symbol-function 'envoy-tmux-send)
+                   (lambda (target prompt &rest _)
+                     (setq sent (list target prompt))))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (should (equal (envoy-notmuch-delegate) "work:7"))
+          (let ((prompt (nth 1 sent)))
+            (should (string-match-p (regexp-quote "THREAD A TEXT") prompt))
+            (should (string-match-p (regexp-quote "THREAD B TEXT") prompt))
+            (should (string-match-p "^THREAD thread:thread-a$" prompt))
+            (should (string-match-p "^THREAD thread:thread-b$" prompt))
+            (should (string-match-p "Primary thread queries:" prompt))
+            (should (string-match-p
+                     (regexp-quote "not (thread:thread-a or thread:thread-b)")
+                     prompt))
+            (should (string-match-p "every thread below" prompt))
+            (should-not (string-match-p "PRIMARY SELECTION" prompt)))
+          (should
+           (equal (reverse notmuch-calls)
+                  '(("show" "--format=text" "--entire-thread=true"
+                     "--exclude=false" "--" "thread:thread-a")
+                    ("show" "--format=text" "--entire-thread=true"
+                     "--exclude=false" "--" "thread:thread-b")))))))))
+
+(ert-deftest envoy-test-notmuch-search-dsh-sends-to-dsh ()
+  "The list page hands its thread to dsh without asking for tmux."
+  (envoy-test--with-notmuch-list
+      '(("thread-dsh" "Dsh list subject" "LIST THREAD FOR DSH\n"))
+    (let (sent)
+      (cl-letf (((symbol-function 'envoy--read-direction)
+                 (lambda (&rest _) "Look at this"))
+                ((symbol-function 'envoy-tmux-read-session)
+                 (lambda (&rest _)
+                   (error "Dsh must not ask for a tmux session")))
+                ((symbol-function 'envoy-tmux-window)
+                 (lambda (&rest _)
+                   (error "Dsh must not open a tmux window")))
+                ((symbol-function 'envoy-tmux--provider-program)
+                 (lambda (&rest _) "/fake/dsh-launch"))
+                ((symbol-function 'envoy-dsh-send)
+                 (lambda (title prompt &optional model plan-into claim effort
+                                     _on-start)
+                   (setq sent (list title model plan-into claim effort))
+                   (should (string-prefix-p
+                            "DIRECTION FROM THE USER\nLook at this\n\n"
+                            prompt))
+                   "*dsh: list*"))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (should (equal (envoy-notmuch-delegate-dsh) "*dsh: list*"))
+        (should (equal sent '("Dsh list subject" nil nil nil nil)))))))
+
+(ert-deftest envoy-test-notmuch-search-without-result-stops-before-dispatch ()
+  "A list line with no thread does no work."
+  (with-temp-buffer
+    (insert "not a result line\n")
+    (let ((major-mode 'notmuch-search-mode)
+          (window-called nil)
+          (send-called nil)
+          (cli-called nil))
+      (cl-letf (((symbol-function 'require) (lambda (&rest _) t))
+                ((symbol-function 'notmuch-search-get-result)
+                 (lambda (&optional _) nil))
+                ((symbol-function 'notmuch-command-to-string)
+                 (lambda (&rest _) (setq cli-called t)))
+                ((symbol-function 'envoy-tmux-window)
+                 (lambda (&rest _) (setq window-called t)))
+                ((symbol-function 'envoy-tmux-send)
+                 (lambda (&rest _) (setq send-called t)))
+                ((symbol-function 'envoy-tmux--omp-program)
+                 (lambda () (error "OMP must not be checked")))
                 ((symbol-function 'envoy--read-direction)
                  (lambda (&rest _) (error "Instruction must not be read"))))
         (should-error (envoy-notmuch-delegate) :type 'user-error))

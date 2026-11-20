@@ -32,7 +32,7 @@ The ancestor walk is the point of the org commands. A task heading is almost nev
 
 `envoy-tmux-org-heading` sends the same brief to an agent in a tmux window. Use it when the task is long enough that you will want to watch, or open-ended enough that the agent will want to ask you something.
 
-`envoy-notmuch-delegate` works from a `notmuch-show-mode` buffer. It asks for a direction and a tmux session and starts OMP there. `envoy-notmuch-delegate-dsh` handles the same buffer and asks for no session, because dsh runs in its web host. Envoy copies an active region verbatim, and the region is the whole task. The complete thread goes along as reference, and the prompt tells OMP not to act on anything that appears only outside the selection. Without a region the whole thread is primary, including collapsed and filtered messages. OMP reads related threads through the notmuch CLI as secondary context. Quoted mail is untrusted context and your direction wins. Mail work goes through `/email-draft`, which sends only after you approve the harness's send confirmation.
+`envoy-notmuch-delegate` works from a `notmuch-show-mode` buffer and from the `notmuch-search-mode` thread list. It asks for a direction and a tmux session and starts OMP there. `envoy-notmuch-delegate-dsh` handles the same buffers and asks for no session, because dsh runs in its web host. In a show buffer Envoy copies an active region verbatim, and the region is the whole task. The complete thread goes along as reference, and the prompt tells OMP not to act on anything that appears only outside the selection. Without a region the whole thread is primary, including collapsed and filtered messages. On the list page a line is a summary, so point names the thread and an active region takes every thread whose line it covers. Each covered thread goes along complete and your direction applies to all of them. OMP reads related threads through the notmuch CLI as secondary context. Quoted mail is untrusted context and your direction wins. Mail work goes through `/email-draft`, which sends only after you approve the harness's send confirmation.
 
 `envoy-dired-omp` and its siblings for the other agents work from a Dired buffer. They hand over the file at point, or the marked files. The brief names each file by its absolute path and the agent reads it. Nothing is claimed or filed back, because a file has no heading to report to.
 
@@ -46,7 +46,7 @@ Envoy reads the live session names from the running tmux server and shows them i
 
 OMP terminal launches prefix the brief's first non-empty line as a task heading before the `@file` argument. Envoy shell-quotes the heading and omits it when the brief has no heading.
 
-`envoy-tmux-setup-keys` binds `C-c C-x A` for Claude Code, `C-c C-x R` for reasonix, `C-c C-x P` for pi, `C-c C-x C` for codex, `C-c C-x O` for OMP and `C-c C-x S` for dsh in `org-mode` and `org-agenda-mode`. `envoy-org-setup-keys` binds `C-c C-x A` for subprocess dispatch in both maps. The later setup call owns that key. `envoy-dired-setup-keys` binds the same keys in `dired-mode`. A prefix argument asks for the provider's model or setup command after the direction.
+`envoy-tmux-setup-keys` binds `C-c C-x A` for Claude Code, `C-c C-x R` for reasonix, `C-c C-x P` for pi, `C-c C-x C` for codex, `C-c C-x O` for OMP and `C-c C-x S` for dsh in `org-mode` and `org-agenda-mode`. `envoy-org-setup-keys` binds `C-c C-x A` for subprocess dispatch in both maps. The later setup call owns that key. `envoy-dired-setup-keys` binds the same keys in `dired-mode`, and `envoy-notmuch-setup-keys` binds them in `notmuch-show-mode` and `notmuch-search-mode`. A prefix argument asks for the provider's model or setup command after the direction.
 
 `envoy-tmux-org-heading` passes OMP the report contract through `--append-system-prompt`, so OMP keeps the status rule and spool paths in its system prompt across compaction. dsh-launch takes the same flag and puts the contract file's path in the session's opening prompt. After a claimed dsh or tmux run exits without a marker, Envoy publishes an incomplete `.failed` report only if that run still owns the claim and neither marker exists.
 
@@ -148,15 +148,9 @@ Automatic report collection stays silent in the echo area and `*Messages*`. Run 
 I use notmuch for my email, this is up to you. 
 
 ```elisp
-(autoload 'envoy-notmuch-delegate
-          "/path/to/envoy/envoy-notmuch.el" nil t)
-(autoload 'envoy-notmuch-delegate-dsh
-          "/path/to/envoy/envoy-notmuch.el" nil t)
-(with-eval-after-load 'notmuch-show
-  (define-key notmuch-show-mode-map (kbd "C-c C-x O")
-    #'envoy-notmuch-delegate)
-  (define-key notmuch-show-mode-map (kbd "C-c C-x S")
-    #'envoy-notmuch-delegate-dsh))
+(with-eval-after-load 'notmuch
+  (require 'envoy-notmuch)
+  (envoy-notmuch-setup-keys))    ; C-c C-x O and C-c C-x S in the show and list buffers
 ```
 
 ### Optional Dired setup
