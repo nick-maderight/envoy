@@ -166,7 +166,7 @@ One of the keys of `envoy-tmux-providers'."
      :variable model
      :setup nil
      ;; The host's fallback chains. A bare deepseek-flash resolves to native DeepSeek.
-     :models ("FallbacksChain/Auto" "FallbacksChain/AutoCC")))
+     :models ("FallbacksChain/Auto" "FallbacksChain/AutoGo2" "FallbacksChain/AutoCC")))
   "Agents envoy knows how to start, in a tmux window or in dsh's web host.
 Each entry is (SYMBOL . PLIST).  The properties are:
 

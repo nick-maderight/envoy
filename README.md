@@ -57,7 +57,7 @@ An OMP prefix argument offers models from the last successful discovery, cached 
 The OMP prefix picker asks for a thinking effort after the launch mode and model selection. It offers `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` and `auto`. An empty effort answer keeps OMP's configured default.
 
 
-The dsh prefix picker offers the host's two fallback chains, `FallbacksChain/Auto` and `FallbacksChain/AutoCC`, then the efforts `low`, `high` and `max`. An empty effort answer keeps dsh's default effort.
+The dsh prefix picker offers the host's three fallback chains, `FallbacksChain/Auto`, `FallbacksChain/AutoGo2` and `FallbacksChain/AutoCC`, then the efforts `low`, `high` and `max`. An empty effort answer keeps dsh's default effort.
 
 ## dsh runs in its web host
 
